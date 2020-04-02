@@ -37,7 +37,7 @@ hardware, thus requiring little on-device storage for an effectively
 unlimited number of supported keys. This drives the requirement that
 the key handle be supplied for each signature operation. U2F tokens
 primarily use ECDSA signatures in the NIST-P256 field, though the FIDO2
-standard specified additional key types include one based on Ed25519.
+standard specifies additional key types, including one based on Ed25519.
 
 SSH U2F Key formats
 -------------------
@@ -48,10 +48,6 @@ OpenSSH integrates U2F as new key and corresponding certificate types:
 	sk-ecdsa-sha2-nistp256-cert-v01@openssh.com
 	sk-ssh-ed25519@openssh.com
 	sk-ssh-ed25519-cert-v01@openssh.com
-
-These key types are supported only for user authentication with the
-"publickey" method. They are not used for host-based user authentication
-or server host key authentication.
 
 While each uses ecdsa-sha256-nistp256 as the underlying signature primitive,
 keys require extra information in the public and private keys, and in
@@ -86,7 +82,7 @@ With a private half consisting of:
 	string		"sk-ssh-ed25519@openssh.com"
 	string		public key
 	string		application (user-specified, but typically "ssh:")
-	uint32		flags
+	uint8		flags
 	string		key_handle
 	string		reserved
 
@@ -110,6 +106,8 @@ information to the public key:
 	string		signature key
 	string		signature
 
+and for security key ed25519 certificates:
+
 	string		"sk-ssh-ed25519-cert-v01@openssh.com"
 	string		nonce
 	string		public key
@@ -126,6 +124,15 @@ information to the public key:
 	string		signature key
 	string		signature
 
+Both security key certificates use the following encoding for private keys:
+
+	string		type (e.g. "sk-ssh-ed25519-cert-v01@openssh.com")
+	string		pubkey (the above key/cert structure)
+	string		application
+	uint8		flags
+	string		key_handle
+	string		reserved
+
 During key generation, the hardware also returns attestation information
 that may be used to cryptographically prove that a given key is
 hardware-backed. Unfortunately, the protocol required for this proof is
@@ -134,31 +141,27 @@ least manufacturer and batch number granularity. For this reason, we
 choose not to include this information in the public key or save it by
 default.
 
-Attestation information is very useful however in an organisational
-context, where it may be used by a CA as part of certificate
-issuance. In this case, exposure to the CA of hardware identity is
-desirable. To support this case, OpenSSH optionally allows retaining the
-attestation information at the time of key generation. It will take the
-following format:
+Attestation information is useful for out-of-band key and certificate
+registration workflows, e.g. proving to a CA that a key is backed
+by trusted hardware before it will issue a certificate. To support this
+case, OpenSSH optionally allows retaining the attestation information
+at the time of key generation. It will take the following format:
 
-	string		"sk-attest-v00"
-	uint32		version		(1 for U2F, 2 for FIDO2 in future)
+	string		"ssh-sk-attest-v00"
 	string		attestation certificate
 	string		enrollment signature
+	uint32		reserved flags
+	string		reserved string
+
+OpenSSH treats the attestation certificate and enrollment signatures as
+opaque objects and does no interpretation of them itself.
 
 SSH U2F signatures
 ------------------
 
-In addition to the message to be signed, the U2F signature operation 
-requires a few additional parameters:
-
-	byte		control bits (e.g. "user presence required" flag)
-	byte[32]	SHA256(message)
-	byte[32]	SHA256(application)
-	byte		key_handle length
-	byte[]		key_handle
-
-This signature is signed over a blob that consists of:
+In addition to the message to be signed, the U2F signature operation
+requires the key handle and a few additional parameters. The signature
+is signed over a blob that consists of:
 
 	byte[32]	SHA256(application)
 	byte		flags (including "user present", extensions present)
@@ -166,11 +169,15 @@ This signature is signed over a blob that consists of:
 	byte[]		extensions
 	byte[32]	SHA256(message)
 
+No extensions are yet defined for SSH use. If any are defined in the future,
+it will be possible to infer their presence from the contents of the "flags"
+value.
+
 The signature returned from U2F hardware takes the following format:
 
 	byte		flags (including "user present")
 	uint32		counter
-	byte[32]	ecdsa_signature (in X9.62 format).
+	byte[]		ecdsa_signature (in X9.62 format).
 
 For use in the SSH protocol, we wish to avoid server-side parsing of ASN.1
 format data in the pre-authentication attack surface. Therefore, the
@@ -195,7 +202,6 @@ For Ed25519 keys the signature is encoded as:
 	byte		flags
 	uint32		counter
 
-
 ssh-agent protocol extensions
 -----------------------------
 
@@ -212,7 +218,7 @@ with a new key constraint extension to encode a path to the middleware
 library for the key. The format of this constraint extension would be:
 
 	byte		SSH_AGENT_CONSTRAIN_EXTENSION
-	string		sk@openssh.com
+	string		sk-provider@openssh.com
 	string		middleware path
 
 This constraint-based approach does not present any compatibility
@@ -230,12 +236,23 @@ support for the common case of USB HID security keys internally.
 
 The middleware library need only expose a handful of functions:
 
+	#define SSH_SK_VERSION_MAJOR		0x00040000 /* API version */
+	#define SSH_SK_VERSION_MAJOR_MASK	0xffff0000
+
 	/* Flags */
 	#define SSH_SK_USER_PRESENCE_REQD	0x01
+	#define SSH_SK_USER_VERIFICATION_REQD	0x04
+	#define SSH_SK_RESIDENT_KEY		0x20
 
 	/* Algs */
 	#define SSH_SK_ECDSA                   0x00
 	#define SSH_SK_ED25519                 0x01
+
+	/* Error codes */
+	#define SSH_SK_ERR_GENERAL		-1
+	#define SSH_SK_ERR_UNSUPPORTED		-2
+	#define SSH_SK_ERR_PIN_REQUIRED		-3
+	#define SSH_SK_ERR_DEVICE_NOT_FOUND	-4
 
 	struct sk_enroll_response {
 		uint8_t *public_key;
@@ -257,21 +274,64 @@ The middleware library need only expose a handful of functions:
 		size_t sig_s_len;
 	};
 
+	struct sk_resident_key {
+		uint32_t alg;
+		size_t slot;
+		char *application;
+		struct sk_enroll_response key;
+	};
+
+	struct sk_option {
+		char *name;
+		char *value;
+		uint8_t important;
+	};
+
 	/* Return the version of the middleware API */
 	uint32_t sk_api_version(void);
 
 	/* Enroll a U2F key (private key generation) */
-	int sk_enroll(int alg, const uint8_t *challenge, size_t challenge_len,
-	    const char *application, uint8_t flags,
+	int sk_enroll(uint32_t alg,
+	    const uint8_t *challenge, size_t challenge_len,
+	    const char *application, uint8_t flags, const char *pin,
+	    struct sk_option **options,
 	    struct sk_enroll_response **enroll_response);
 
 	/* Sign a challenge */
-	int sk_sign(int alg, const uint8_t *message, size_t message_len,
+	int sk_sign(uint32_t alg, const uint8_t *message, size_t message_len,
 	    const char *application,
 	    const uint8_t *key_handle, size_t key_handle_len,
-	    uint8_t flags, struct sk_sign_response **sign_response);
+	    uint8_t flags, const char *pin, struct sk_option **options,
+	    struct sk_sign_response **sign_response);
 
-In OpenSSH, these will be invoked by generalising the existing
-ssh-pkcs11-helper mechanism to provide containment of the middleware from
-ssh-agent.
+	/* Enumerate all resident keys */
+	int sk_load_resident_keys(const char *pin, struct sk_option **options,
+	    struct sk_resident_key ***rks, size_t *nrks);
+
+The SSH_SK_VERSION_MAJOR should be incremented for each incompatible
+API change.
+
+The options may be used to pass miscellaneous options to the middleware
+as a NULL-terminated array of pointers to struct sk_option. The middleware
+may ignore unsupported or unknown options unless the "important" flag is
+set, in which case it should return failure if an unsupported option is
+requested.
+
+At present the following options names are supported:
+
+	"device"
+
+	Specifies a specific FIDO device on which to perform the
+	operation. The value in this field is interpreted by the
+	middleware but it would be typical to specify a path to
+	a /dev node for the device in question.
+
+	"user"
+
+	Specifies the FIDO2 username used when enrolling a key,
+	overriding OpenSSH's default of using an all-zero username.
+
+In OpenSSH, the middleware will be invoked by using a similar mechanism to
+ssh-pkcs11-helper to provide address-space containment of the
+middleware from ssh-agent.
 

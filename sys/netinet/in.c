@@ -1,4 +1,4 @@
-/*	$OpenBSD: in.c,v 1.166 2019/11/08 07:16:29 dlg Exp $	*/
+/*	$OpenBSD: in.c,v 1.169 2020/03/15 05:34:13 visa Exp $	*/
 /*	$NetBSD: in.c,v 1.26 1996/02/13 23:41:39 christos Exp $	*/
 
 /*
@@ -330,8 +330,16 @@ in_ioctl(u_long cmd, caddr_t data, struct ifnet *ifp, int privileged)
 			error = EINVAL;
 			break;
 		}
+		/* do not check inet family or strict len */
+		sin = satosin(&ifr->ifr_addr);
+		if (ntohl(sin->sin_addr.s_addr) &
+		    (~ntohl(sin->sin_addr.s_addr) >> 1)) {
+			/* non-contiguous netmask */
+			error = EINVAL;
+			break;
+		}
 		ia->ia_netmask = ia->ia_sockmask.sin_addr.s_addr =
-		    satosin(&ifr->ifr_addr)->sin_addr.s_addr;
+		    sin->sin_addr.s_addr;
 		break;
 	}
 err:
@@ -404,6 +412,7 @@ in_ioctl_change_ifaddr(u_long cmd, caddr_t data, struct ifnet *ifp,
 	struct in_ifaddr *ia = NULL;
 	struct in_aliasreq *ifra = (struct in_aliasreq *)data;
 	struct sockaddr_in *sin = NULL, *dstsin = NULL, *broadsin = NULL;
+	struct sockaddr_in *masksin = NULL;
 	int error = 0;
 	int newifaddr;
 
@@ -437,6 +446,14 @@ in_ioctl_change_ifaddr(u_long cmd, caddr_t data, struct ifnet *ifp,
 
 		if (ifra->ifra_mask.sin_len) {
 			if (ifra->ifra_mask.sin_len < 8) {
+				error = EINVAL;
+				break;
+			}
+			/* do not check inet family or strict len */
+			masksin = &ifra->ifra_mask;
+			if (ntohl(masksin->sin_addr.s_addr) &
+			    (~ntohl(masksin->sin_addr.s_addr) >> 1)) {
+				/* non-contiguous netmask */
 				error = EINVAL;
 				break;
 			}
@@ -480,10 +497,10 @@ in_ioctl_change_ifaddr(u_long cmd, caddr_t data, struct ifnet *ifp,
 		    sin->sin_addr.s_addr != ia->ia_addr.sin_addr.s_addr) {
 			needinit = 1;
 		}
-		if (ifra->ifra_mask.sin_len) {
+		if (masksin != NULL) {
 			in_ifscrub(ifp, ia);
 			ia->ia_netmask = ia->ia_sockmask.sin_addr.s_addr =
-			    ifra->ifra_mask.sin_addr.s_addr;
+			    masksin->sin_addr.s_addr;
 			needinit = 1;
 		}
 		if (dstsin != NULL) {
@@ -540,11 +557,14 @@ in_ioctl_get(u_long cmd, caddr_t data, struct ifnet *ifp)
 	struct ifreq *ifr = (struct ifreq *)data;
 	struct ifaddr *ifa;
 	struct in_ifaddr *ia = NULL;
+	struct sockaddr *sa;
 	struct sockaddr_in *sin = NULL;
 	int error = 0;
 
-	if (ifr->ifr_addr.sa_family == AF_INET) {
-		error = in_sa2sin(&ifr->ifr_addr, &sin);
+	sa = &ifr->ifr_addr;
+	if (sa->sa_family == AF_INET) {
+		sa->sa_len = sizeof(struct sockaddr_in);
+		error = in_sa2sin(sa, &sin);
 		if (error)
 			return (error);
 	}
@@ -909,7 +929,9 @@ in_delmulti(struct in_multi *inm)
 			    sizeof(struct sockaddr_in);
 			satosin(&ifr.ifr_addr)->sin_family = AF_INET;
 			satosin(&ifr.ifr_addr)->sin_addr = inm->inm_addr;
+			KERNEL_LOCK();
 			(*ifp->if_ioctl)(ifp, SIOCDELMULTI, (caddr_t)&ifr);
+			KERNEL_UNLOCK();
 
 			TAILQ_REMOVE(&ifp->if_maddrlist, &inm->inm_ifma,
 			    ifma_list);

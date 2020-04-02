@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_rge.c,v 1.1 2019/11/18 03:03:37 kevlo Exp $	*/
+/*	$OpenBSD: if_rge.c,v 1.3 2020/03/27 15:15:24 krw Exp $	*/
 
 /*
  * Copyright (c) 2019 Kevin Lo <kevlo@openbsd.org>
@@ -620,7 +620,7 @@ rge_init(struct ifnet *ifp)
 	for (i = 0; i < 64; i++)
 		RGE_WRITE_4(sc, RGE_IM(i), 0);
 
-	/* Set the initial RX and TX and configurations. */
+	/* Set the initial RX and TX configurations. */
 	RGE_WRITE_4(sc, RGE_RXCFG, RGE_RXCFG_CONFIG);
 	RGE_WRITE_4(sc, RGE_TXCFG, RGE_TXCFG_CONFIG);
 
@@ -1115,12 +1115,12 @@ rge_rxeof(struct rge_softc *sc)
 	uint32_t rxstat, extsts;
 	int i, total_len, rx = 0;
 
-	/* Invalidate the descriptor memory. */
-	bus_dmamap_sync(sc->sc_dmat, sc->rge_ldata.rge_rx_list_map,
-	    i * sizeof(struct rge_rx_desc), sizeof(struct rge_rx_desc),
-	    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
-
 	for (i = sc->rge_ldata.rge_rxq_prodidx; ; i = RGE_NEXT_RX_DESC(i)) {
+		/* Invalidate the descriptor memory. */
+		bus_dmamap_sync(sc->sc_dmat, sc->rge_ldata.rge_rx_list_map,
+		    i * sizeof(struct rge_rx_desc), sizeof(struct rge_rx_desc),
+		    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
+
 		cur_rx = &sc->rge_ldata.rge_rx_list[i];
 
 		if (RGE_OWN(cur_rx))
@@ -1241,13 +1241,14 @@ rge_txeof(struct rge_softc *sc)
 	prod = sc->rge_ldata.rge_txq_prodidx;
 	cons = sc->rge_ldata.rge_txq_considx;
 
-	bus_dmamap_sync(sc->sc_dmat, sc->rge_ldata.rge_tx_list_map,
-	    idx * sizeof(struct rge_tx_desc), sizeof(struct rge_tx_desc),
-	    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
-
 	while (prod != cons) {
 		txq = &sc->rge_ldata.rge_txq[cons];
 		idx = txq->txq_descidx;
+
+		bus_dmamap_sync(sc->sc_dmat, sc->rge_ldata.rge_tx_list_map,
+		    idx * sizeof(struct rge_tx_desc),
+		    sizeof(struct rge_tx_desc),
+		    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
 
 		txstat = letoh32(sc->rge_ldata.rge_tx_list[idx].rge_cmdsts);
 
@@ -1382,7 +1383,7 @@ rge_set_phy_power(struct rge_softc *sc, int on)
 		rge_write_phy(sc, 0, MII_BMCR, BMCR_AUTOEN);
 
 		for (i = 0; i < RGE_TIMEOUT; i++) {
-			if ((rge_read_phy_ocp(sc, 0xa420) & 0x0080) == 3)
+			if ((rge_read_phy_ocp(sc, 0xa420) & 0x0007) == 3)
 				break;
 			DELAY(1000);
 		}
@@ -1823,7 +1824,7 @@ rge_exit_oob(struct rge_softc *sc)
 
 	if (rge_read_mac_ocp(sc, 0xd42c) & 0x0100) {
 		for (i = 0; i < RGE_TIMEOUT; i++) {
-			if ((rge_read_phy_ocp(sc, 0xa420) & 0x0080) == 2)
+			if ((rge_read_phy_ocp(sc, 0xa420) & 0x0007) == 2)
 				break;
 			DELAY(1000);
 		}

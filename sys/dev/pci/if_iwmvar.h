@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_iwmvar.h,v 1.47 2019/11/18 18:53:11 stsp Exp $	*/
+/*	$OpenBSD: if_iwmvar.h,v 1.53 2020/04/02 12:34:27 stsp Exp $	*/
 
 /*
  * Copyright (c) 2014 genua mbh <info@genua.de>
@@ -258,7 +258,6 @@ struct iwm_tx_data {
 	bus_addr_t	scratch_paddr;
 	struct mbuf	*m;
 	struct iwm_node *in;
-	int done;
 };
 
 struct iwm_tx_ring {
@@ -270,6 +269,7 @@ struct iwm_tx_ring {
 	int			qid;
 	int			queued;
 	int			cur;
+	int			tail;
 };
 
 #define IWM_RX_MQ_RING_COUNT	512
@@ -394,6 +394,7 @@ struct iwm_softc {
 	pci_chipset_tag_t sc_pct;
 	pcitag_t sc_pcitag;
 	const void *sc_ih;
+	int sc_msix;
 
 	/* TX scheduler rings. */
 	struct iwm_dma_info		sched_dma;
@@ -443,6 +444,11 @@ struct iwm_softc {
 
 	int sc_intmask;
 	int sc_flags;
+
+	uint32_t sc_fh_init_mask;
+	uint32_t sc_hw_init_mask;
+	uint32_t sc_fh_mask;
+	uint32_t sc_hw_mask;
 
 	/*
 	 * So why do we need a separate stopped flag and a generation?
@@ -540,7 +546,9 @@ struct iwm_node {
 	uint16_t in_color;
 
 	struct ieee80211_amrr_node in_amn;
+	int chosen_txrate;
 	struct ieee80211_mira_node in_mn;
+	int chosen_txmcs;
 
 	/* Set in 11n mode if we don't receive ACKs for OFDM frames. */
 	int ht_force_cck;
@@ -548,6 +556,7 @@ struct iwm_node {
 };
 #define IWM_STATION_ID 0
 #define IWM_AUX_STA_ID 1
+#define IWM_MONITOR_STA_ID 2
 
 #define IWM_ICT_SIZE		4096
 #define IWM_ICT_COUNT		(IWM_ICT_SIZE / sizeof (uint32_t))

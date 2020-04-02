@@ -1,4 +1,4 @@
-/*	$OpenBSD: fetch.c,v 1.179 2019/11/18 04:37:35 deraadt Exp $	*/
+/*	$OpenBSD: fetch.c,v 1.194 2020/02/22 01:00:07 jca Exp $	*/
 /*	$NetBSD: fetch.c,v 1.14 1997/08/18 10:20:20 lukem Exp $	*/
 
 /*-
@@ -68,6 +68,7 @@ struct tls;
 #include "ftp_var.h"
 #include "cmds.h"
 
+static int	file_get(const char *, const char *);
 static int	url_get(const char *, const char *, const char *, int);
 static int	save_chunked(FILE *, struct tls *, int , char *, size_t);
 static void	aborthttp(int);
@@ -76,8 +77,13 @@ static char	hextochar(const char *);
 static char	*urldecode(const char *);
 static char	*recode_credentials(const char *_userinfo);
 static char	*ftp_readline(FILE *, size_t *);
-static void	ftp_close(FILE **, struct tls **, volatile int *);
+static void	ftp_close(FILE **, struct tls **, int *);
 static const char *sockerror(struct tls *);
+#ifdef SMALL
+#define 	ftp_printf(fp, ...) fprintf(fp, __VA_ARGS__)
+#else
+static int	ftp_printf(FILE *, const char *, ...);
+#endif /* SMALL */
 #ifndef NOSSL
 static int	proxy_connect(int, char *, char *);
 static int	stdio_tls_write_wrapper(void *, const char *, int);
@@ -177,8 +183,126 @@ tooslow(int signo)
 }
 
 /*
+ * Copy a local file (used by the OpenBSD installer).
+ * Returns -1 on failure, 0 on success
+ */
+static int
+file_get(const char *path, const char *outfile)
+{
+	struct stat	 st;
+	int		 fd, out, rval = -1, save_errno;
+	volatile sig_t	 oldintr, oldinti;
+	const char	*savefile;
+	char		*buf = NULL, *cp;
+	const size_t	 buflen = 128 * 1024;
+	off_t		 hashbytes;
+	ssize_t		 len, wlen;
+
+	direction = "received";
+
+	fd = open(path, O_RDONLY);
+	if (fd == -1) {
+		warn("Can't open file %s", path);
+		return -1;
+	}
+
+	if (fstat(fd, &st) == -1)
+		filesize = -1;
+	else
+		filesize = st.st_size;
+
+	if (outfile != NULL)
+		savefile = outfile;
+	else {
+		if (path[strlen(path) - 1] == '/')	/* Consider no file */
+			savefile = NULL;		/* after dir invalid. */
+		else
+			savefile = basename(path);
+	}
+
+	if (EMPTYSTRING(savefile)) {
+		warnx("No filename after directory (use -o): %s", path);
+		goto cleanup_copy;
+	}
+
+	/* Open the output file.  */
+	if (!pipeout) {
+		out = open(savefile, O_CREAT | O_WRONLY | O_TRUNC, 0666);
+		if (out == -1) {
+			warn("Can't open %s", savefile);
+			goto cleanup_copy;
+		}
+	} else
+		out = fileno(stdout);
+
+	if ((buf = malloc(buflen)) == NULL)
+		errx(1, "Can't allocate memory for transfer buffer");
+
+	/* Trap signals */
+	oldintr = NULL;
+	oldinti = NULL;
+	if (setjmp(httpabort)) {
+		if (oldintr)
+			(void)signal(SIGINT, oldintr);
+		if (oldinti)
+			(void)signal(SIGINFO, oldinti);
+		goto cleanup_copy;
+	}
+	oldintr = signal(SIGINT, abortfile);
+
+	bytes = 0;
+	hashbytes = mark;
+	progressmeter(-1, path);
+
+	/* Finally, suck down the file. */
+	oldinti = signal(SIGINFO, psummary);
+	while ((len = read(fd, buf, buflen)) > 0) {
+		bytes += len;
+		for (cp = buf; len > 0; len -= wlen, cp += wlen) {
+			if ((wlen = write(out, cp, len)) == -1) {
+				warn("Writing %s", savefile);
+				signal(SIGINFO, oldinti);
+				goto cleanup_copy;
+			}
+		}
+		if (hash && !progress) {
+			while (bytes >= hashbytes) {
+				(void)putc('#', ttyout);
+				hashbytes += mark;
+			}
+			(void)fflush(ttyout);
+		}
+	}
+	save_errno = errno;
+	signal(SIGINFO, oldinti);
+	if (hash && !progress && bytes > 0) {
+		if (bytes < mark)
+			(void)putc('#', ttyout);
+		(void)putc('\n', ttyout);
+		(void)fflush(ttyout);
+	}
+	if (len == -1) {
+		warnc(save_errno, "Reading from file");
+		goto cleanup_copy;
+	}
+	progressmeter(1, NULL);
+	if (verbose)
+		ptransfer(0);
+	(void)signal(SIGINT, oldintr);
+
+	rval = 0;
+
+cleanup_copy:
+	free(buf);
+	if (out >= 0 && out != fileno(stdout))
+		close(out);
+	close(fd);
+
+	return rval;
+}
+
+/*
  * Retrieve URL, via the proxy in $proxyvar if necessary.
- * Modifies the string argument given.
  * Returns -1 on failure, 0 on success
  */
 static int
@@ -187,13 +311,13 @@ url_get(const char *origline, const char *proxyenv, const char *outfile, int las
 	char pbuf[NI_MAXSERV], hbuf[NI_MAXHOST], *cp, *portnum, *path, ststr[4];
 	char *hosttail, *cause = "unknown", *newline, *host, *port, *buf = NULL;
 	char *epath, *redirurl, *loctail, *h, *p, gerror[200];
-	int error, i, isftpurl = 0, isfileurl = 0, isredirect = 0, rval = -1;
+	int error, isftpurl = 0, isredirect = 0, rval = -1;
 	int isunavail = 0, retryafter = -1;
 	struct addrinfo hints, *res0, *res;
-	const char * volatile savefile;
-	char * volatile proxyurl = NULL;
-	char *credentials = NULL;
-	volatile int fd = -1, out = -1;
+	const char *savefile;
+	char *proxyurl = NULL;
+	char *credentials = NULL, *proxy_credentials = NULL;
+	int fd = -1, out = -1;
 	volatile sig_t oldintr, oldinti;
 	FILE *fin = NULL;
 	off_t hashbytes;
@@ -202,14 +326,14 @@ url_get(const char *origline, const char *proxyenv, const char *outfile, int las
 	char *proxyhost = NULL;
 #ifndef NOSSL
 	char *sslpath = NULL, *sslhost = NULL;
-	char *full_host = NULL;
-	const char *scheme;
-	int ishttpurl = 0, ishttpsurl = 0;
+	int ishttpsurl = 0;
 #endif /* !NOSSL */
 #ifndef SMALL
+	char *full_host = NULL;
+	const char *scheme;
 	char *locbase;
 	struct addrinfo *ares = NULL;
-#endif
+#endif /* !SMALL */
 	struct tls *tls = NULL;
 	int status;
 	int save_errno;
@@ -224,7 +348,6 @@ url_get(const char *origline, const char *proxyenv, const char *outfile, int las
 	if (strncasecmp(newline, HTTP_URL, sizeof(HTTP_URL) - 1) == 0) {
 		host = newline + sizeof(HTTP_URL) - 1;
 #ifndef SMALL
-		ishttpurl = 1;
 		scheme = HTTP_URL;
 #endif /* !SMALL */
 	} else if (strncasecmp(newline, FTP_URL, sizeof(FTP_URL) - 1) == 0) {
@@ -233,59 +356,57 @@ url_get(const char *origline, const char *proxyenv, const char *outfile, int las
 #ifndef SMALL
 		scheme = FTP_URL;
 #endif /* !SMALL */
-	} else if (strncasecmp(newline, FILE_URL, sizeof(FILE_URL) - 1) == 0) {
-		host = newline + sizeof(FILE_URL) - 1;
-		isfileurl = 1;
-#ifndef NOSSL
-		scheme = FILE_URL;
 	} else if (strncasecmp(newline, HTTPS_URL, sizeof(HTTPS_URL) - 1) == 0) {
+#ifndef NOSSL
 		host = newline + sizeof(HTTPS_URL) - 1;
 		ishttpsurl = 1;
-		scheme = HTTPS_URL;
+#else
+		errx(1, "%s: No HTTPS support", newline);
 #endif /* !NOSSL */
+#ifndef SMALL
+		scheme = HTTPS_URL;
+#endif /* !SMALL */
 	} else
-		errx(1, "url_get: Invalid URL '%s'", newline);
+		errx(1, "%s: URL not permitted", newline);
 
-	if (isfileurl) {
-		path = host;
-	} else {
-		path = strchr(host, '/');		/* Find path */
-		if (EMPTYSTRING(path)) {
-			if (outfile) {			/* No slash, but */
-				path=strchr(host,'\0');	/* we have outfile. */
-				goto noslash;
-			}
-			if (isftpurl)
-				goto noftpautologin;
-			warnx("No `/' after host (use -o): %s", origline);
-			goto cleanup_url_get;
+	path = strchr(host, '/');		/* Find path */
+
+	/*
+	 * Look for auth header in host.
+	 * Basic auth from RFC 2617, valid characters for path are in
+	 * RFC 3986 section 3.3.
+	 */
+	if (!isftpurl) {
+		p = strchr(host, '@');
+		if (p != NULL && (path == NULL || p < path)) {
+			*p++ = '\0';
+			credentials = recode_credentials(host);
+
+			/* Overwrite userinfo */
+			memmove(host, p, strlen(p) + 1);
+			path = strchr(host, '/');
 		}
-		*path++ = '\0';
-		if (EMPTYSTRING(path) && !outfile) {
-			if (isftpurl)
-				goto noftpautologin;
-			warnx("No filename after host (use -o): %s", origline);
-			goto cleanup_url_get;
+	}
+
+	if (EMPTYSTRING(path)) {
+		if (outfile) {				/* No slash, but */
+			path = strchr(host,'\0');	/* we have outfile. */
+			goto noslash;
 		}
+		if (isftpurl)
+			goto noftpautologin;
+		warnx("No `/' after host (use -o): %s", origline);
+		goto cleanup_url_get;
+	}
+	*path++ = '\0';
+	if (EMPTYSTRING(path) && !outfile) {
+		if (isftpurl)
+			goto noftpautologin;
+		warnx("No filename after host (use -o): %s", origline);
+		goto cleanup_url_get;
 	}
 
 noslash:
-
-#ifndef NOSSL
-	/*
-	 * Look for auth header in host, since now host does not
-	 * contain the path. Basic auth from RFC 2617, valid
-	 * characters for path are in RFC 3986 section 3.3.
-	 */
-	if (proxyenv == NULL && (ishttpurl || ishttpsurl)) {
-		if ((p = strchr(host, '@')) != NULL) {
-			*p = '\0';
-			credentials = recode_credentials(host);
-			host = p + 1;
-		}
-	}
-#endif	/* NOSSL */
-
 	if (outfile)
 		savefile = outfile;
 	else {
@@ -309,7 +430,7 @@ noslash:
 	}
 #endif /* !SMALL */
 
-	if (!isfileurl && proxyenv != NULL) {		/* use proxy */
+	if (proxyenv != NULL) {		/* use proxy */
 #ifndef NOSSL
 		if (ishttpsurl) {
 			sslpath = strdup(path);
@@ -349,7 +470,7 @@ noslash:
 				warnx("Malformed proxy URL: %s", proxyenv);
 				goto cleanup_url_get;
 			}
-			credentials = recode_credentials(host);
+			proxy_credentials = recode_credentials(host);
 			*path = '@'; /* restore @ in proxyurl */
 
 			/*
@@ -364,112 +485,6 @@ noslash:
 		}
 
 		path = newline;
-	}
-
-	if (isfileurl) {
-		struct stat st;
-
-		fd = open(path, O_RDONLY);
-		if (fd == -1) {
-			warn("Can't open file %s", path);
-			goto cleanup_url_get;
-		}
-
-		if (fstat(fd, &st) == -1)
-			filesize = -1;
-		else
-			filesize = st.st_size;
-
-		/* Open the output file.  */
-		if (!pipeout) {
-#ifndef SMALL
-			if (resume)
-				out = open(savefile, O_CREAT | O_WRONLY |
-					O_APPEND, 0666);
-
-			else
-#endif /* !SMALL */
-				out = open(savefile, O_CREAT | O_WRONLY |
-					O_TRUNC, 0666);
-			if (out < 0) {
-				warn("Can't open %s", savefile);
-				goto cleanup_url_get;
-			}
-		} else
-			out = fileno(stdout);
-
-#ifndef SMALL
-		if (resume) {
-			if (fstat(out, &st) == -1) {
-				warn("Can't fstat %s", savefile);
-				goto cleanup_url_get;
-			}
-			if (lseek(fd, st.st_size, SEEK_SET) == -1) {
-				warn("Can't lseek %s", path);
-				goto cleanup_url_get;
-			}
-			restart_point = st.st_size;
-		}
-#endif /* !SMALL */
-
-		/* Trap signals */
-		oldintr = NULL;
-		oldinti = NULL;
-		if (setjmp(httpabort)) {
-			if (oldintr)
-				(void)signal(SIGINT, oldintr);
-			if (oldinti)
-				(void)signal(SIGINFO, oldinti);
-			goto cleanup_url_get;
-		}
-		oldintr = signal(SIGINT, abortfile);
-
-		bytes = 0;
-		hashbytes = mark;
-		progressmeter(-1, path);
-
-		if ((buf = malloc(buflen)) == NULL)
-			errx(1, "Can't allocate memory for transfer buffer");
-
-		/* Finally, suck down the file. */
-		i = 0;
-		oldinti = signal(SIGINFO, psummary);
-		while ((len = read(fd, buf, buflen)) > 0) {
-			bytes += len;
-			for (cp = buf; len > 0; len -= i, cp += i) {
-				if ((i = write(out, cp, len)) == -1) {
-					warn("Writing %s", savefile);
-					signal(SIGINFO, oldinti);
-					goto cleanup_url_get;
-				} else if (i == 0)
-					break;
-			}
-			if (hash && !progress) {
-				while (bytes >= hashbytes) {
-					(void)putc('#', ttyout);
-					hashbytes += mark;
-				}
-				(void)fflush(ttyout);
-			}
-		}
-		signal(SIGINFO, oldinti);
-		if (hash && !progress && bytes > 0) {
-			if (bytes < mark)
-				(void)putc('#', ttyout);
-			(void)putc('\n', ttyout);
-			(void)fflush(ttyout);
-		}
-		if (len != 0) {
-			warn("Reading from file");
-			goto cleanup_url_get;
-		}
-		progressmeter(1, NULL);
-		if (verbose)
-			ptransfer(0);
-		(void)signal(SIGINT, oldintr);
-
-		rval = 0;
-		goto cleanup_url_get;
 	}
 
 	if (*host == '[' && (hosttail = strrchr(host, ']')) != NULL &&
@@ -599,7 +614,7 @@ noslash:
 
 #ifndef NOSSL
 		if (proxyenv && sslhost)
-			proxy_connect(fd, sslhost, credentials);
+			proxy_connect(fd, sslhost, proxy_credentials);
 #endif /* !NOSSL */
 		break;
 	}
@@ -615,6 +630,7 @@ noslash:
 
 #ifndef NOSSL
 	if (ishttpsurl) {
+		ssize_t ret;
 		if (proxyenv && sslpath) {
 			ishttpsurl = 0;
 			proxyurl = NULL;
@@ -630,16 +646,19 @@ noslash:
 			goto cleanup_url_get;
 		}
 		if (tls_configure(tls, tls_config) != 0) {
-			fprintf(ttyout, "SSL configuration failure: %s\n",
+			fprintf(ttyout, "TLS configuration failure: %s\n",
 			    tls_error(tls));
 			goto cleanup_url_get;
 		}
 		if (tls_connect_socket(tls, fd, sslhost) != 0) {
-			fprintf(ttyout, "SSL failure: %s\n", tls_error(tls));
+			fprintf(ttyout, "TLS connect failure: %s\n", tls_error(tls));
 			goto cleanup_url_get;
 		}
-		if (tls_handshake(tls) != 0) {
-			fprintf(ttyout, "SSL failure: %s\n", tls_error(tls));
+		do {
+			ret = tls_handshake(tls);
+		} while (ret == TLS_WANT_POLLIN || ret == TLS_WANT_POLLOUT);
+		if (ret != 0) {
+			fprintf(ttyout, "TLS handshake failure: %s\n", tls_error(tls));
 			goto cleanup_url_get;
 		}
 		fin = funopen(tls, stdio_tls_read_wrapper,
@@ -687,18 +706,17 @@ noslash:
 		 * Host: directive must use the destination host address for
 		 * the original URI (path).
 		 */
+		ftp_printf(fin, "GET %s HTTP/1.1\r\n"
+		    "Connection: close\r\n"
+		    "Host: %s\r\n%s%s\r\n",
+		    epath, proxyhost, buf ? buf : "", httpuseragent);
 		if (credentials)
-			fprintf(fin, "GET %s HTTP/1.1\r\n"
-			    "Connection: close\r\n"
-			    "Proxy-Authorization: Basic %s\r\n"
-			    "Host: %s\r\n%s%s\r\n\r\n",
-			    epath, credentials,
-			    proxyhost, buf ? buf : "", httpuseragent);
-		else
-			fprintf(fin, "GET %s HTTP/1.1\r\n"
-			    "Connection: close\r\n"
-			    "Host: %s\r\n%s%s\r\n\r\n",
-			    epath, proxyhost, buf ? buf : "", httpuseragent);
+			ftp_printf(fin, "Authorization: Basic %s\r\n",
+			    credentials);
+		if (proxy_credentials)
+			ftp_printf(fin, "Proxy-Authorization: Basic %s\r\n",
+			    proxy_credentials);
+		ftp_printf(fin, "\r\n");
 	} else {
 		if (verbose)
 			fprintf(ttyout, "Requesting %s\n", origline);
@@ -712,23 +730,12 @@ noslash:
 				restart_point = 0;
 		}
 #endif	/* SMALL */
-#ifndef NOSSL
-		if (credentials) {
-			fprintf(fin,
-			    "GET /%s HTTP/1.1\r\n"
-			    "Connection: close\r\n"
-			    "Authorization: Basic %s\r\n"
-			    "Host: ", epath, credentials);
-			free(credentials);
-			credentials = NULL;
-		} else
-#endif	/* NOSSL */
-			fprintf(fin,
-			    "GET /%s HTTP/1.1\r\n"
-			    "Connection: close\r\n"
-			    "Host: ", epath);
+		ftp_printf(fin,
+		    "GET /%s HTTP/1.1\r\n"
+		    "Connection: close\r\n"
+		    "Host: ", epath);
 		if (proxyhost) {
-			fprintf(fin, "%s", proxyhost);
+			ftp_printf(fin, "%s", proxyhost);
 			port = NULL;
 		} else if (strchr(host, ':')) {
 			/*
@@ -740,10 +747,10 @@ noslash:
 				errx(1, "Can't allocate memory.");
 			if ((p = strchr(h, '%')) != NULL)
 				*p = '\0';
-			fprintf(fin, "[%s]", h);
+			ftp_printf(fin, "[%s]", h);
 			free(h);
 		} else
-			fprintf(fin, "%s", host);
+			ftp_printf(fin, "%s", host);
 
 		/*
 		 * Send port number only if it's specified and does not equal
@@ -752,16 +759,20 @@ noslash:
 		 */
 #ifndef NOSSL
 		if (port && strcmp(port, (ishttpsurl ? "443" : "80")) != 0)
-			fprintf(fin, ":%s", port);
+			ftp_printf(fin, ":%s", port);
 		if (restart_point)
-			fprintf(fin, "\r\nRange: bytes=%lld-",
+			ftp_printf(fin, "\r\nRange: bytes=%lld-",
 				(long long)restart_point);
 #else /* !NOSSL */
 		if (port && strcmp(port, "80") != 0)
-			fprintf(fin, ":%s", port);
+			ftp_printf(fin, ":%s", port);
 #endif /* !NOSSL */
-		fprintf(fin, "\r\n%s%s\r\n\r\n",
+		ftp_printf(fin, "\r\n%s%s\r\n",
 		    buf ? buf : "", httpuseragent);
+		if (credentials)
+			ftp_printf(fin, "Authorization: Basic %s\r\n",
+			    credentials);
+		ftp_printf(fin, "\r\n");
 	}
 	free(epath);
 
@@ -997,6 +1008,10 @@ noslash:
 #endif
 	}
 
+	free(buf);
+	if ((buf = malloc(buflen)) == NULL)
+		errx(1, "Can't allocate memory for transfer buffer");
+
 	/* Trap signals */
 	oldintr = NULL;
 	oldinti = NULL;
@@ -1013,30 +1028,22 @@ noslash:
 	hashbytes = mark;
 	progressmeter(-1, path);
 
-	free(buf);
-
 	/* Finally, suck down the file. */
-	if ((buf = malloc(buflen)) == NULL)
-		errx(1, "Can't allocate memory for transfer buffer");
 	oldinti = signal(SIGINFO, psummary);
 	if (chunked) {
-		if (save_chunked(fin, tls, out, buf, buflen) == -1) {
-			signal(SIGINFO, oldinti);
+		error = save_chunked(fin, tls, out, buf, buflen);
+		signal(SIGINFO, oldinti);
+		if (error == -1)
 			goto cleanup_url_get;
-		}
 	} else {
-		i = 0;
-		len = 1;
-		while (len > 0) {
-			len = fread(buf, 1, buflen, fin);
+		while ((len = fread(buf, 1, buflen, fin)) > 0) {
 			bytes += len;
-			for (cp = buf, wlen = len; wlen > 0; wlen -= i, cp += i) {
-				if ((i = write(out, cp, wlen)) == -1) {
+			for (cp = buf; len > 0; len -= wlen, cp += wlen) {
+				if ((wlen = write(out, cp, len)) == -1) {
 					warn("Writing %s", savefile);
 					signal(SIGINFO, oldinti);
 					goto cleanup_url_get;
-				} else if (i == 0)
-					break;
+				}
 			}
 			if (hash && !progress) {
 				while (bytes >= hashbytes) {
@@ -1046,6 +1053,7 @@ noslash:
 				(void)fflush(ttyout);
 			}
 		}
+		save_errno = errno;
 		signal(SIGINFO, oldinti);
 		if (hash && !progress && bytes > 0) {
 			if (bytes < mark)
@@ -1053,7 +1061,8 @@ noslash:
 			(void)putc('\n', ttyout);
 			(void)fflush(ttyout);
 		}
-		if (len != 0) {
+		if (len == 0 && ferror(fin)) {
+			errno = save_errno;
 			warnx("Reading from socket: %s", sockerror(tls));
 			goto cleanup_url_get;
 		}
@@ -1085,8 +1094,10 @@ improper:
 	warnx("Improper response from %s", host);
 
 cleanup_url_get:
-#ifndef NOSSL
+#ifndef SMALL
 	free(full_host);
+#endif /* !SMALL */
+#ifndef NOSSL
 	free(sslhost);
 #endif /* !NOSSL */
 	ftp_close(&fin, &tls, &fd);
@@ -1097,6 +1108,7 @@ cleanup_url_get:
 	free(proxyurl);
 	free(newline);
 	free(credentials);
+	free(proxy_credentials);
 	return (rval);
 }
 
@@ -1255,15 +1267,17 @@ auto_fetch(int argc, char *argv[], char *outfile)
 		if (url == NULL)
 			errx(1, "Can't allocate memory for auto-fetch.");
 
+		if (strncasecmp(url, FILE_URL, sizeof(FILE_URL) - 1) == 0) {
+			if (file_get(url + sizeof(FILE_URL) - 1, outfile) == -1)
+				rval = argpos + 1;
+			continue;
+		}
+
 		/*
-		 * Try HTTP URL-style arguments first.
+		 * Try HTTP URL-style arguments next.
 		 */
 		if (strncasecmp(url, HTTP_URL, sizeof(HTTP_URL) - 1) == 0 ||
-#ifndef NOSSL
-		    /* even if we compiled without SSL, url_get will check */
-		    strncasecmp(url, HTTPS_URL, sizeof(HTTPS_URL) -1) == 0 ||
-#endif /* !NOSSL */
-		    strncasecmp(url, FILE_URL, sizeof(FILE_URL) - 1) == 0) {
+		    strncasecmp(url, HTTPS_URL, sizeof(HTTPS_URL) -1) == 0) {
 			redirect_loop = 0;
 			retried = 0;
 			if (url_get(url, httpproxy, outfile, lastfile) == -1)
@@ -1608,8 +1622,29 @@ ftp_readline(FILE *fp, size_t *lenp)
 	return fparseln(fp, lenp, NULL, "\0\0\0", 0);
 }
 
+#ifndef SMALL
+static int
+ftp_printf(FILE *fp, const char *fmt, ...)
+{
+	va_list	ap;
+	int	ret;
+
+	va_start(ap, fmt);
+	ret = vfprintf(fp, fmt, ap);
+	va_end(ap);
+
+	if (debug) {
+		va_start(ap, fmt);
+		vfprintf(ttyout, fmt, ap);
+		va_end(ap);
+	}
+
+	return ret;
+}
+#endif /* !SMALL */
+
 static void
-ftp_close(FILE **fin, struct tls **tls, volatile int *fd)
+ftp_close(FILE **fin, struct tls **tls, int *fd)
 {
 #ifndef NOSSL
 	int	ret;

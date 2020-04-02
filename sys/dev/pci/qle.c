@@ -1,4 +1,4 @@
-/*	$OpenBSD: qle.c,v 1.47 2019/10/16 00:16:35 daniel Exp $ */
+/*	$OpenBSD: qle.c,v 1.52 2020/03/25 05:30:18 jmatthew Exp $ */
 
 /*
  * Copyright (c) 2013, 2014 Jonathan Matthew <jmatthew@openbsd.org>
@@ -255,11 +255,7 @@ int		qle_scsi_probe(struct scsi_link *);
 
 
 struct scsi_adapter qle_switch = {
-	qle_scsi_cmd,
-	scsi_minphys,
-	qle_scsi_probe,
-	NULL,	/* scsi_free */
-	NULL	/* ioctl */
+	qle_scsi_cmd, NULL, qle_scsi_probe, NULL, NULL
 };
 
 u_int32_t	qle_read(struct qle_softc *, int);
@@ -1101,6 +1097,7 @@ qle_handle_resp(struct qle_softc *sc, u_int32_t id)
 		switch (completion) {
 		case QLE_IOCB_STATUS_DATA_UNDERRUN:
 			xs->resid = lemtoh32(&status->resid);
+			/* FALLTHROUGH */
 		case QLE_IOCB_STATUS_DATA_OVERRUN:
 		case QLE_IOCB_STATUS_COMPLETE:
 			if (lemtoh16(&status->scsi_status) &
@@ -1496,8 +1493,8 @@ qle_mbox(struct qle_softc *sc, int maskin)
 		mtx_enter(&sc->sc_mbox_mtx);
 		sc->sc_mbox_pending = 1;
 		while (sc->sc_mbox_pending == 1) {
-			msleep(sc->sc_mbox, &sc->sc_mbox_mtx, PRIBIO,
-			    "qlembox", 0);
+			msleep_nsec(sc->sc_mbox, &sc->sc_mbox_mtx, PRIBIO,
+			    "qlembox", INFSLP);
 		}
 		result = sc->sc_mbox[0];
 		sc->sc_mbox_pending = 0;
@@ -1886,7 +1883,8 @@ qle_ct_pass_through(struct qle_softc *sc, u_int32_t port_handle,
 			if (qle_read_isr(sc, &isr, &info) != 0)
 				qle_handle_intr(sc, isr, info);
 		} else {
-			tsleep(sc->sc_scratch, PRIBIO, "qle_fabric", 100);
+			tsleep_nsec(sc->sc_scratch, PRIBIO, "qle_fabric",
+			    SEC_TO_NSEC(1));
 		}
 	}
 	if (rv == 0)
@@ -2014,7 +2012,8 @@ qle_fabric_plogx(struct qle_softc *sc, struct qle_fc_port *port, int flags,
 			if (qle_read_isr(sc, &isr, &info) != 0)
 				qle_handle_intr(sc, isr, info);
 		} else {
-			tsleep(sc->sc_scratch, PRIBIO, "qle_fabric", 100);
+			tsleep_nsec(sc->sc_scratch, PRIBIO, "qle_fabric",
+			    SEC_TO_NSEC(1));
 		}
 	}
 	sc->sc_fabric_pending = 0;

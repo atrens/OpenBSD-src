@@ -1,4 +1,4 @@
-/*	$OpenBSD: sched_bsd.c,v 1.59 2019/11/04 18:06:03 visa Exp $	*/
+/*	$OpenBSD: sched_bsd.c,v 1.62 2020/01/30 08:51:27 mpi Exp $	*/
 /*	$NetBSD: kern_synch.c,v 1.37 1996/04/22 01:38:37 christos Exp $	*/
 
 /*-
@@ -48,6 +48,7 @@
 #include <sys/sched.h>
 #include <sys/timeout.h>
 #include <sys/smr.h>
+#include <sys/tracepoint.h>
 
 #ifdef KTRACE
 #include <sys/ktrace.h>
@@ -254,14 +255,10 @@ schedcpu(void *arg)
 		newcpu = (u_int) decay_cpu(loadfac, p->p_estcpu);
 		setpriority(p, newcpu, p->p_p->ps_nice);
 
-		if (p->p_priority >= PUSER) {
-			if (p->p_stat == SRUN &&
-			    (p->p_priority / SCHED_PPQ) !=
-			    (p->p_usrpri / SCHED_PPQ)) {
-				remrunqueue(p);
-				setrunqueue(p->p_cpu, p, p->p_usrpri);
-			} else
-				p->p_priority = p->p_usrpri;
+		if (p->p_stat == SRUN &&
+		    (p->p_runpri / SCHED_PPQ) != (p->p_usrpri / SCHED_PPQ)) {
+			remrunqueue(p);
+			setrunqueue(p->p_cpu, p, p->p_usrpri);
 		}
 		SCHED_UNLOCK(s);
 	}
@@ -392,8 +389,12 @@ mi_switch(void)
 
 	if (p != nextproc) {
 		uvmexp.swtch++;
+		TRACEPOINT(sched, off__cpu, nextproc->p_tid,
+		    nextproc->p_p->ps_pid);
 		cpu_switchto(p, nextproc);
+		TRACEPOINT(sched, on__cpu, NULL);
 	} else {
+		TRACEPOINT(sched, remain__cpu, NULL);
 		p->p_stat = SONPROC;
 	}
 
@@ -438,12 +439,14 @@ mi_switch(void)
 
 /*
  * Change process state to be runnable,
- * placing it on the run queue if it is in memory,
- * and awakening the swapper if it isn't in memory.
+ * placing it on the run queue.
  */
 void
 setrunnable(struct proc *p)
 {
+	struct process *pr = p->p_p;
+	u_char prio;
+
 	SCHED_ASSERT_LOCKED();
 
 	switch (p->p_stat) {
@@ -459,18 +462,22 @@ setrunnable(struct proc *p)
 		 * If we're being traced (possibly because someone attached us
 		 * while we were stopped), check for a signal from the debugger.
 		 */
-		if ((p->p_p->ps_flags & PS_TRACED) != 0 && p->p_xstat != 0)
-			atomic_setbits_int(&p->p_siglist, sigmask(p->p_xstat));
+		if ((pr->ps_flags & PS_TRACED) != 0 && pr->ps_xsig != 0)
+			atomic_setbits_int(&p->p_siglist, sigmask(pr->ps_xsig));
+		prio = p->p_usrpri;
+		unsleep(p);
+		break;
 	case SSLEEP:
+		prio = p->p_slppri;
 		unsleep(p);		/* e.g. when sending signals */
 		break;
 	}
-	setrunqueue(NULL, p, p->p_priority);
+	setrunqueue(NULL, p, prio);
 	if (p->p_slptime > 1) {
 		uint32_t newcpu;
 
 		newcpu = decay_aftersleep(p->p_estcpu, p->p_slptime);
-		setpriority(p, newcpu, p->p_p->ps_nice);
+		setpriority(p, newcpu, pr->ps_nice);
 	}
 	p->p_slptime = 0;
 }
@@ -518,8 +525,6 @@ schedclock(struct proc *p)
 	SCHED_LOCK(s);
 	newcpu = ESTCPULIM(p->p_estcpu + 1);
 	setpriority(p, newcpu, p->p_p->ps_nice);
-	if (p->p_priority >= PUSER)
-		p->p_priority = p->p_usrpri;
 	SCHED_UNLOCK(s);
 }
 

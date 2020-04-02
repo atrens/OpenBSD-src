@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh-agent.c,v 1.250 2019/11/19 16:02:32 jmc Exp $ */
+/* $OpenBSD: ssh-agent.c,v 1.257 2020/03/06 18:28:27 markus Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -76,7 +76,7 @@
 #include "ssherr.h"
 #include "pathnames.h"
 #include "ssh-pkcs11.h"
-#include "ssh-sk.h"
+#include "sk-api.h"
 
 #ifndef DEFAULT_PROVIDER_WHITELIST
 # define DEFAULT_PROVIDER_WHITELIST "/usr/lib*/*,/usr/local/lib*/*"
@@ -268,130 +268,6 @@ agent_decode_alg(struct sshkey *key, u_int flags)
 	return NULL;
 }
 
-static int
-provider_sign(const char *provider, struct sshkey *key,
-    u_char **sigp, size_t *lenp,
-    const u_char *data, size_t datalen,
-    const char *alg, u_int compat)
-{
-	int status, pair[2], r = SSH_ERR_INTERNAL_ERROR;
-	pid_t pid;
-	char *helper, *verbosity = NULL, *fp = NULL;
-	struct sshbuf *kbuf, *req, *resp;
-	u_char version;
-	struct notifier_ctx *notifier = NULL;
-
-	debug3("%s: start for provider %s", __func__, provider);
-
-	*sigp = NULL;
-	*lenp = 0;
-
-	helper = getenv("SSH_SK_HELPER");
-	if (helper == NULL || strlen(helper) == 0)
-		helper = _PATH_SSH_SK_HELPER;
-	if (log_level_get() >= SYSLOG_LEVEL_DEBUG1)
-		verbosity = "-vvv";
-
-	/* Start helper */
-	if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == -1) {
-		error("socketpair: %s", strerror(errno));
-		return SSH_ERR_SYSTEM_ERROR;
-	}
-	if ((pid = fork()) == -1) {
-		error("fork: %s", strerror(errno));
-		close(pair[0]);
-		close(pair[1]);
-		return SSH_ERR_SYSTEM_ERROR;
-	}
-	if (pid == 0) {
-		if ((dup2(pair[1], STDIN_FILENO) == -1) ||
-		    (dup2(pair[1], STDOUT_FILENO) == -1))
-			fatal("%s: dup2: %s", __func__, ssh_err(r));
-		close(pair[0]);
-		close(pair[1]);
-		closefrom(STDERR_FILENO + 1);
-		debug("%s: starting %s %s", __func__, helper,
-		    verbosity == NULL ? "" : verbosity);
-		execlp(helper, helper, verbosity, (char *)NULL);
-		fatal("%s: execlp: %s", __func__, strerror(errno));
-	}
-	close(pair[1]);
-
-	if ((kbuf = sshbuf_new()) == NULL ||
-	    (req = sshbuf_new()) == NULL ||
-	    (resp = sshbuf_new()) == NULL)
-		fatal("%s: sshbuf_new failed", __func__);
-
-	if ((r = sshkey_private_serialize(key, kbuf)) != 0 ||
-	    (r = sshbuf_put_stringb(req, kbuf)) != 0 ||
-	    (r = sshbuf_put_cstring(req, provider)) != 0 ||
-	    (r = sshbuf_put_string(req, data, datalen)) != 0 ||
-	    (r = sshbuf_put_u32(req, compat)) != 0)
-		fatal("%s: compose: %s", __func__, ssh_err(r));
-
-	if ((fp = sshkey_fingerprint(key, SSH_FP_HASH_DEFAULT,
-	    SSH_FP_DEFAULT)) == NULL)
-		fatal("%s: sshkey_fingerprint failed", __func__);
-	notifier = notify_start(0,
-	    "Confirm user presence for key %s %s", sshkey_type(key), fp);
-
-	if ((r = ssh_msg_send(pair[0], SSH_SK_HELPER_VERSION, req)) != 0) {
-		error("%s: send: %s", __func__, ssh_err(r));
-		goto out;
-	}
-	if ((r = ssh_msg_recv(pair[0], resp)) != 0) {
-		error("%s: receive: %s", __func__, ssh_err(r));
-		goto out;
-	}
-	if ((r = sshbuf_get_u8(resp, &version)) != 0) {
-		error("%s: parse version: %s", __func__, ssh_err(r));
-		goto out;
-	}
-	if (version != SSH_SK_HELPER_VERSION) {
-		error("%s: unsupported version: got %u, expected %u",
-		    __func__, version, SSH_SK_HELPER_VERSION);
-		r = SSH_ERR_INVALID_FORMAT;
-		goto out;
-	}
-	if ((r = sshbuf_get_string(resp, sigp, lenp)) != 0) {
-		error("%s: parse signature: %s", __func__, ssh_err(r));
-		r = SSH_ERR_INVALID_FORMAT;
-		goto out;
-	}
-	if (sshbuf_len(resp) != 0) {
-		error("%s: trailing data in response", __func__);
-		r = SSH_ERR_INVALID_FORMAT;
-		goto out;
-	}
-	/* success */
-	r = 0;
- out:
-	while (waitpid(pid, &status, 0) == -1) {
-		if (errno != EINTR)
-			fatal("%s: waitpid: %s", __func__, ssh_err(r));
-	}
-	notify_complete(notifier);
-	if (!WIFEXITED(status)) {
-		error("%s: helper %s exited abnormally", __func__, helper);
-		if (r == 0)
-			r = SSH_ERR_SYSTEM_ERROR;
-	} else if (WEXITSTATUS(status) != 0) {
-		error("%s: helper %s exited with non-zero exit status",
-		    __func__, helper);
-		if (r == 0)
-			r = SSH_ERR_SYSTEM_ERROR;
-	}
-	if (r != 0) {
-		freezero(*sigp, *lenp);
-		*sigp = NULL;
-		*lenp = 0;
-	}
-	sshbuf_free(kbuf);
-	sshbuf_free(req);
-	sshbuf_free(resp);
-	return r;
-}
-
 /* ssh2 only */
 static void
 process_sign_request2(SocketEntry *e)
@@ -401,9 +277,11 @@ process_sign_request2(SocketEntry *e)
 	size_t dlen, slen = 0;
 	u_int compat = 0, flags;
 	int r, ok = -1;
+	char *fp = NULL;
 	struct sshbuf *msg;
 	struct sshkey *key = NULL;
 	struct identity *id;
+	struct notifier_ctx *notifier = NULL;
 
 	if ((msg = sshbuf_new()) == NULL)
 		fatal("%s: sshbuf_new failed", __func__);
@@ -422,25 +300,27 @@ process_sign_request2(SocketEntry *e)
 		verbose("%s: user refused key", __func__);
 		goto send;
 	}
-	if (id->sk_provider != NULL) {
-		if ((r = provider_sign(id->sk_provider, id->key, &signature,
-		    &slen, data, dlen, agent_decode_alg(key, flags),
-		    compat)) != 0) {
-			error("%s: sign: %s", __func__, ssh_err(r));
-			goto send;
-		}
-	} else {
-		if ((r = sshkey_sign(id->key, &signature, &slen,
-		    data, dlen, agent_decode_alg(key, flags),
-		    NULL, compat)) != 0) {
-			error("%s: sshkey_sign: %s", __func__, ssh_err(r));
-			goto send;
-		}
+	if (sshkey_is_sk(id->key) &&
+	    (id->key->sk_flags & SSH_SK_USER_PRESENCE_REQD)) {
+		if ((fp = sshkey_fingerprint(key, SSH_FP_HASH_DEFAULT,
+		    SSH_FP_DEFAULT)) == NULL)
+			fatal("%s: fingerprint failed", __func__);
+		notifier = notify_start(0,
+		    "Confirm user presence for key %s %s",
+		    sshkey_type(id->key), fp);
+	}
+	if ((r = sshkey_sign(id->key, &signature, &slen,
+	    data, dlen, agent_decode_alg(key, flags),
+	    id->sk_provider, compat)) != 0) {
+		error("%s: sshkey_sign: %s", __func__, ssh_err(r));
+		goto send;
 	}
 	/* Success */
 	ok = 0;
  send:
+	notify_complete(notifier);
 	sshkey_free(key);
+	free(fp);
 	if (ok == 0) {
 		if ((r = sshbuf_put_u8(msg, SSH2_AGENT_SIGN_RESPONSE)) != 0 ||
 		    (r = sshbuf_put_string(msg, signature, slen)) != 0)
@@ -534,8 +414,9 @@ process_add_identity(SocketEntry *e)
 {
 	Identity *id;
 	int success = 0, confirm = 0;
-	u_int seconds, maxsign;
+	u_int seconds = 0, maxsign;
 	char *fp, *comment = NULL, *ext_name = NULL, *sk_provider = NULL;
+	char canonical_provider[PATH_MAX];
 	time_t death = 0;
 	struct sshkey *k = NULL;
 	u_char ctype;
@@ -615,19 +496,30 @@ process_add_identity(SocketEntry *e)
 	}
 	if (sk_provider != NULL) {
 		if (!sshkey_is_sk(k)) {
-			error("Cannot add provider: %s is not a security key",
-			    sshkey_type(k));
+			error("Cannot add provider: %s is not an "
+			    "authenticator-hosted key", sshkey_type(k));
 			free(sk_provider);
 			goto send;
 		}
-		if (strcasecmp(sk_provider, "internal") == 0)
+		if (strcasecmp(sk_provider, "internal") == 0) {
 			debug("%s: internal provider", __func__);
-		else if (match_pattern_list(sk_provider,
-		    provider_whitelist, 0) != 1) {
-			error("Refusing add key: provider %s not whitelisted",
-			    sk_provider);
+		} else {
+			if (realpath(sk_provider, canonical_provider) == NULL) {
+				verbose("failed provider \"%.100s\": "
+				    "realpath: %s", sk_provider,
+				    strerror(errno));
+				free(sk_provider);
+				goto send;
+			}
 			free(sk_provider);
-			goto send;
+			sk_provider = xstrdup(canonical_provider);
+			if (match_pattern_list(sk_provider,
+			    provider_whitelist, 0) != 1) {
+				error("Refusing add key: "
+				    "provider %s not whitelisted", sk_provider);
+				free(sk_provider);
+				goto send;
+			}
 		}
 	}
 	if ((r = sshkey_shield_private(k)) != 0) {
@@ -714,8 +606,7 @@ process_lock_agent(SocketEntry *e, int lock)
 			fatal("bcrypt_pbkdf");
 		success = 1;
 	}
-	explicit_bzero(passwd, pwlen);
-	free(passwd);
+	freezero(passwd, pwlen);
 	send_status(e, success);
 }
 
@@ -739,6 +630,7 @@ static void
 process_add_smartcard_key(SocketEntry *e)
 {
 	char *provider = NULL, *pin = NULL, canonical_provider[PATH_MAX];
+	char **comments = NULL;
 	int r, i, count = 0, success = 0, confirm = 0;
 	u_int seconds;
 	time_t death = 0;
@@ -788,28 +680,34 @@ process_add_smartcard_key(SocketEntry *e)
 	if (lifetime && !death)
 		death = monotime() + lifetime;
 
-	count = pkcs11_add_provider(canonical_provider, pin, &keys);
+	count = pkcs11_add_provider(canonical_provider, pin, &keys, &comments);
 	for (i = 0; i < count; i++) {
 		k = keys[i];
 		if (lookup_identity(k) == NULL) {
 			id = xcalloc(1, sizeof(Identity));
 			id->key = k;
+			keys[i] = NULL; /* transferred */
 			id->provider = xstrdup(canonical_provider);
-			id->comment = xstrdup(canonical_provider); /* XXX */
+			if (*comments[i] != '\0') {
+				id->comment = comments[i];
+				comments[i] = NULL; /* transferred */
+			} else {
+				id->comment = xstrdup(canonical_provider);
+			}
 			id->death = death;
 			id->confirm = confirm;
 			TAILQ_INSERT_TAIL(&idtab->idlist, id, next);
 			idtab->nentries++;
 			success = 1;
-		} else {
-			sshkey_free(k);
 		}
-		keys[i] = NULL;
+		sshkey_free(keys[i]);
+		free(comments[i]);
 	}
 send:
 	free(pin);
 	free(provider);
 	free(keys);
+	free(comments);
 	send_status(e, success);
 }
 
@@ -1503,10 +1401,10 @@ skip:
 	if (ac > 0)
 		parent_alive_interval = 10;
 	idtab_init();
-	signal(SIGPIPE, SIG_IGN);
-	signal(SIGINT, (d_flag | D_flag) ? cleanup_handler : SIG_IGN);
-	signal(SIGHUP, cleanup_handler);
-	signal(SIGTERM, cleanup_handler);
+	ssh_signal(SIGPIPE, SIG_IGN);
+	ssh_signal(SIGINT, (d_flag | D_flag) ? cleanup_handler : SIG_IGN);
+	ssh_signal(SIGHUP, cleanup_handler);
+	ssh_signal(SIGTERM, cleanup_handler);
 
 	if (pledge("stdio rpath cpath unix id proc exec", NULL) == -1)
 		fatal("%s: pledge: %s", __progname, strerror(errno));

@@ -3216,7 +3216,7 @@ inteldrm_wsioctl(void *v, u_long cmd, caddr_t data, int flag, struct proc *p)
 
 	switch (cmd) {
 	case WSDISPLAYIO_GTYPE:
-		*(int *)data = WSDISPLAY_TYPE_INTELDRM;
+		*(u_int *)data = WSDISPLAY_TYPE_INTELDRM;
 		return 0;
 	case WSDISPLAYIO_GINFO:
 		wdf = (struct wsdisplay_fbinfo *)data;
@@ -3569,8 +3569,9 @@ inteldrm_attach(struct device *parent, struct device *self, void *aux)
 		return;
 	}
 
-	printf("%s: %s\n", dev_priv->sc_dev.dv_xname,
-	    pci_intr_string(dev_priv->pc, dev_priv->ih));
+	printf("%s: %s, %s, gen %d\n", dev_priv->sc_dev.dv_xname,
+	    pci_intr_string(dev_priv->pc, dev_priv->ih),
+	    intel_platform_name(dev_priv->info.platform), INTEL_GEN(dev_priv));
 
 	dev_priv->irqh = pci_intr_establish(dev_priv->pc, dev_priv->ih,
 	    IPL_TTY, inteldrm_intr, dev_priv, dev_priv->sc_dev.dv_xname);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: dwc2.c,v 1.48 2019/03/14 04:28:10 visa Exp $	*/
+/*	$OpenBSD: dwc2.c,v 1.51 2020/03/21 12:08:31 patrick Exp $	*/
 /*	$NetBSD: dwc2.c,v 1.32 2014/09/02 23:26:20 macallan Exp $	*/
 
 /*-
@@ -474,7 +474,7 @@ dwc2_open(struct usbd_pipe *pipe)
 	case UE_CONTROL:
 		pipe->methods = &dwc2_device_ctrl_methods;
 		err = usb_allocmem(&sc->sc_bus, sizeof(usb_device_request_t),
-		    0, &dpipe->req_dma);
+		    0, USB_DMA_COHERENT, &dpipe->req_dma);
 		if (err)
 			return err;
 		break;
@@ -551,7 +551,7 @@ dwc2_abort_xfer(struct usbd_xfer *xfer, usbd_status status)
 		xfer->status = status;
 		dxfer->flags |= DWC2_XFER_ABORTWAIT;
 		while (dxfer->flags & DWC2_XFER_ABORTING)
-			tsleep(&dxfer->flags, PZERO, "dwc2xfer", 0);
+			tsleep_nsec(&dxfer->flags, PZERO, "dwc2xfer", INFSLP);
 		return;
 	}
 

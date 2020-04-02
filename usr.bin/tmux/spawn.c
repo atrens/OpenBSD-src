@@ -1,4 +1,4 @@
-/* $OpenBSD: spawn.c,v 1.11 2019/11/14 07:55:01 nicm Exp $ */
+/* $OpenBSD: spawn.c,v 1.19 2020/03/31 17:14:40 nicm Exp $ */
 
 /*
  * Copyright (c) 2019 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -80,12 +80,14 @@ spawn_log(const char *from, struct spawn_context *sc)
 struct winlink *
 spawn_window(struct spawn_context *sc, char **cause)
 {
+	struct cmdq_item	*item = sc->item;
+	struct client		*c = item->client;
 	struct session		*s = sc->s;
 	struct window		*w;
 	struct window_pane	*wp;
 	struct winlink		*wl;
 	int			 idx = sc->idx;
-	u_int			 sx, sy;
+	u_int			 sx, sy, xpixel, ypixel;
 
 	spawn_log(__func__, sc);
 
@@ -155,8 +157,9 @@ spawn_window(struct spawn_context *sc, char **cause)
 			xasprintf(cause, "couldn't add window %d", idx);
 			return (NULL);
 		}
-		default_window_size(sc->c, s, NULL, &sx, &sy, -1);
-		if ((w = window_create(sx, sy)) == NULL) {
+		default_window_size(sc->c, s, NULL, &sx, &sy, &xpixel, &ypixel,
+		    -1);
+		if ((w = window_create(sx, sy, xpixel, ypixel)) == NULL) {
 			winlink_remove(&s->windows, sc->wl);
 			xasprintf(cause, "couldn't create window %d", idx);
 			return (NULL);
@@ -181,7 +184,8 @@ spawn_window(struct spawn_context *sc, char **cause)
 	/* Set the name of the new window. */
 	if (~sc->flags & SPAWN_RESPAWN) {
 		if (sc->name != NULL) {
-			w->name = xstrdup(sc->name);
+			w->name = format_single(item, sc->name, c, s, NULL,
+			    NULL);
 			options_set_number(w->options, "automatic-rename", 0);
 		} else
 			w->name = xstrdup(default_window_name(w));
@@ -222,6 +226,17 @@ spawn_pane(struct spawn_context *sc, char **cause)
 	spawn_log(__func__, sc);
 
 	/*
+	 * Work out the current working directory. If respawning, use
+	 * the pane's stored one unless specified.
+	 */
+	if (sc->cwd != NULL)
+		cwd = format_single(item, sc->cwd, c, item->target.s, NULL, NULL);
+	else if (~sc->flags & SPAWN_RESPAWN)
+		cwd = xstrdup(server_client_get_cwd(c, item->target.s));
+	else
+		cwd = NULL;
+
+	/*
 	 * If we are respawning then get rid of the old process. Otherwise
 	 * either create a new cell or assign to the one we are given.
 	 */
@@ -231,6 +246,7 @@ spawn_pane(struct spawn_context *sc, char **cause)
 			window_pane_index(sc->wp0, &idx);
 			xasprintf(cause, "pane %s:%d.%u still active",
 			    s->name, sc->wl->idx, idx);
+			free(cwd);
 			return (NULL);
 		}
 		if (sc->wp0->fd != -1) {
@@ -239,7 +255,8 @@ spawn_pane(struct spawn_context *sc, char **cause)
 		}
 		window_pane_reset_mode_all(sc->wp0);
 		screen_reinit(&sc->wp0->base);
-		input_init(sc->wp0);
+		input_free(sc->wp0->ictx);
+		sc->wp0->ictx = NULL;
 		new_wp = sc->wp0;
 		new_wp->flags &= ~(PANE_STATUSREADY|PANE_STATUSDRAWN);
 	} else if (sc->lc == NULL) {
@@ -251,8 +268,8 @@ spawn_pane(struct spawn_context *sc, char **cause)
 	}
 
 	/*
-	 * Now we have a pane with nothing running in it ready for the new
-	 * process. Work out the command and arguments.
+	 * Now we have a pane with nothing running in it ready for the new process.
+	 * Work out the command and arguments and store the working directory.
 	 */
 	if (sc->argc == 0 && (~sc->flags & SPAWN_RESPAWN)) {
 		cmd = options_get_string(s->options, "default-command");
@@ -267,6 +284,10 @@ spawn_pane(struct spawn_context *sc, char **cause)
 		argc = sc->argc;
 		argv = sc->argv;
 	}
+	if (cwd != NULL) {
+		free(new_wp->cwd);
+		new_wp->cwd = cwd;
+	}
 
 	/*
 	 * Replace the stored arguments if there are new ones. If not, the
@@ -278,26 +299,11 @@ spawn_pane(struct spawn_context *sc, char **cause)
 		new_wp->argv = cmd_copy_argv(argc, argv);
 	}
 
-	/*
-	 * Work out the current working directory. If respawning, use
-	 * the pane's stored one unless specified.
-	 */
-	if (sc->cwd != NULL)
-		cwd = format_single(item, sc->cwd, c, s, NULL, NULL);
-	else if (~sc->flags & SPAWN_RESPAWN)
-		cwd = xstrdup(server_client_get_cwd(c, s));
-	else
-		cwd = NULL;
-	if (cwd != NULL) {
-		free(new_wp->cwd);
-		new_wp->cwd = cwd;
-	}
-
 	/* Create an environment for this pane. */
 	child = environ_for_session(s, 0);
 	if (sc->environ != NULL)
 		environ_copy(sc->environ, child);
-	environ_set(child, "TMUX_PANE", "%%%u", new_wp->id);
+	environ_set(child, "TMUX_PANE", 0, "%%%u", new_wp->id);
 
 	/*
 	 * Then the PATH environment variable. The session one is replaced from
@@ -307,20 +313,20 @@ spawn_pane(struct spawn_context *sc, char **cause)
 	if (c != NULL && c->session == NULL) { /* only unattached clients */
 		ee = environ_find(c->environ, "PATH");
 		if (ee != NULL)
-			environ_set(child, "PATH", "%s", ee->value);
+			environ_set(child, "PATH", 0, "%s", ee->value);
 	}
 	if (environ_find(child, "PATH") == NULL)
-		environ_set(child, "%s", _PATH_DEFPATH);
+		environ_set(child, "PATH", 0, "%s", _PATH_DEFPATH);
 
 	/* Then the shell. If respawning, use the old one. */
 	if (~sc->flags & SPAWN_RESPAWN) {
 		tmp = options_get_string(s->options, "default-shell");
-		if (*tmp == '\0' || areshell(tmp))
+		if (!checkshell(tmp))
 			tmp = _PATH_BSHELL;
 		free(new_wp->shell);
 		new_wp->shell = xstrdup(tmp);
 	}
-	environ_set(child, "SHELL", "%s", new_wp->shell);
+	environ_set(child, "SHELL", 0, "%s", new_wp->shell);
 
 	/* Log the arguments we are going to use. */
 	log_debug("%s: shell=%s", __func__, new_wp->shell);
@@ -338,6 +344,8 @@ spawn_pane(struct spawn_context *sc, char **cause)
 	memset(&ws, 0, sizeof ws);
 	ws.ws_col = screen_size_x(&new_wp->base);
 	ws.ws_row = screen_size_y(&new_wp->base);
+	ws.ws_xpixel = w->xpixel * ws.ws_col;
+	ws.ws_ypixel = w->ypixel * ws.ws_row;
 
 	/* Block signals until fork has completed. */
 	sigfillset(&set);

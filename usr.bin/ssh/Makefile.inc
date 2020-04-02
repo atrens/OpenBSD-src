@@ -1,4 +1,4 @@
-#	$OpenBSD: Makefile.inc,v 1.79 2019/11/18 16:08:57 naddy Exp $
+#	$OpenBSD: Makefile.inc,v 1.82 2020/01/25 23:02:13 djm Exp $
 
 .include <bsd.own.mk>
 
@@ -34,9 +34,14 @@ CDIAGFLAGS+=	-Wold-style-definition
 WARNINGS=yes
 
 OPENSSL?=	yes
+ZLIB?=		yes
 
 .if (${OPENSSL:L} == "yes")
 CFLAGS+=	-DWITH_OPENSSL
+.endif
+
+.if (${ZLIB:L} == "yes")
+CFLAGS+=	-DWITH_ZLIB
 .endif
 
 CFLAGS+=	-DENABLE_PKCS11
@@ -71,8 +76,6 @@ SRCS_KEY+=	cipher.c
 SRCS_KEY+=	cipher-chachapoly.c
 SRCS_KEY+=	chacha.c
 SRCS_KEY+=	poly1305.c
-SRCS_KEY+=	ssh-sk.c
-SRCS_KEY+=	sk-usbhid.c
 .if (${OPENSSL:L} == "yes")
 SRCS_KEY+=	ssh-dss.c
 SRCS_KEY+=	ssh-ecdsa.c
@@ -96,6 +99,8 @@ SRCS_KEY+=	verify.c
 SRCS_KEY+=	hash.c
 
 SRCS_KEYP+=	authfile.c
+SRCS_KEYP+=	sshbuf-io.c
+SRCS_KEYP+=	atomicio.c
 
 SRCS_KRL+=	bitmap.c
 SRCS_KRL+=	krl.c
@@ -126,6 +131,11 @@ SRCS_PKCS11+=
 SRCS_PKCS11_CLIENT+=
 SRCS_MODULI+=
 .endif
+
+SRCS_SK=		ssh-sk.c
+SRCS_SK+=		sk-usbhid.c
+SRCS_SK_CLIENT=		ssh-sk-client.c
+SRCS_SK_CLIENT+=	msg.c
 
 WITH_XMSS?=	no
 .if (${WITH_XMSS:L} == "yes")

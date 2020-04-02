@@ -1,6 +1,6 @@
 #!/bin/ksh
 #
-# $OpenBSD: sysupgrade.sh,v 1.33 2019/11/12 08:19:11 sthen Exp $
+# $OpenBSD: sysupgrade.sh,v 1.37 2020/01/26 22:08:36 benno Exp $
 #
 # Copyright (c) 1997-2015 Todd Miller, Theo de Raadt, Ken Westerback
 # Copyright (c) 2015 Robert Peichaer <rpe@openbsd.org>
@@ -126,18 +126,7 @@ else
 	URL=${MIRROR}/${NEXT_VERSION}/${ARCH}/
 fi
 
-if [[ -e ${SETSDIR} ]]; then
-	eval $(stat -s ${SETSDIR})
-	[[ $st_uid -eq 0 ]] ||
-		 ug_err "${SETSDIR} needs to be owned by root:wheel"
-	[[ $st_gid -eq 0 ]] ||
-		 ug_err "${SETSDIR} needs to be owned by root:wheel"
-	[[ $st_mode -eq 040755 ]] || 
-		ug_err "${SETSDIR} is not a directory with permissions 0755"
-else
-	mkdir -p ${SETSDIR}
-fi
-
+install -d -o 0 -g 0 -m 0755 ${SETSDIR}
 cd ${SETSDIR}
 
 echo "Fetching from ${URL}"
@@ -209,6 +198,7 @@ echo Fetching updated firmware.
 fw_update || echo "Warning: firmware not updated."
 
 install -F -m 700 bsd.rd /bsd.upgrade
+logger -t sysupgrade -p kern.info "installed new /bsd.upgrade. Old kernel version: $(sysctl -n kern.version)"
 sync
 
 if ${REBOOT}; then

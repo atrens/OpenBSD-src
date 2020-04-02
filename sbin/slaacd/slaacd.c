@@ -1,4 +1,4 @@
-/*	$OpenBSD: slaacd.c,v 1.43 2019/11/21 03:55:22 florian Exp $	*/
+/*	$OpenBSD: slaacd.c,v 1.46 2019/12/15 16:34:08 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2017 Florian Obser <florian@openbsd.org>
@@ -69,7 +69,7 @@ void	configure_gateway(struct imsg_configure_dfr *, uint8_t);
 void	add_gateway(struct imsg_configure_dfr *);
 void	delete_gateway(struct imsg_configure_dfr *);
 #ifndef	SMALL
-void	send_rdns_proposal(struct imsg_propose_rdns *, uint8_t);
+void	send_rdns_proposal(struct imsg_propose_rdns *);
 #endif	/* SMALL */
 int	get_soiikey(uint8_t *);
 
@@ -128,6 +128,7 @@ main(int argc, char *argv[])
 	int			 frontend_routesock, rtfilter;
 	char			*csock = SLAACD_SOCKET;
 #ifndef SMALL
+	struct imsg_propose_rdns rdns;
 	int			 control_fd;
 #endif /* SMALL */
 
@@ -292,6 +293,14 @@ main(int argc, char *argv[])
 #endif /* SMALL */
 
 	main_imsg_compose_frontend(IMSG_STARTUP, 0, NULL, 0);
+
+#ifndef SMALL
+	/* we are taking over, clear all previos slaac proposals */
+	memset(&rdns, 0, sizeof(rdns));
+	rdns.if_index = 0;
+	rdns.rdns_count = 0;
+	send_rdns_proposal(&rdns);
+#endif /* SMALL */
 
 	event_dispatch();
 
@@ -547,15 +556,11 @@ main_dispatch_engine(int fd, short event, void *bula)
 				    "length: %lu", __func__,
 				    IMSG_DATA_SIZE(imsg));
 			memcpy(&rdns, imsg.data, sizeof(rdns));
-			send_rdns_proposal(&rdns, RTF_UP);
-			break;
-		case IMSG_WITHDRAW_RDNS:
-			if (IMSG_DATA_SIZE(imsg) != sizeof(rdns))
-				fatalx("%s: IMSG_WITHDRAW_RDNS wrong "
-				    "length: %lu", __func__,
-				    IMSG_DATA_SIZE(imsg));
-			memcpy(&rdns, imsg.data, sizeof(rdns));
-			send_rdns_proposal(&rdns, 0);
+			if ((2 + rdns.rdns_count * sizeof(struct in6_addr)) >
+			    sizeof(struct sockaddr_rtdns))
+				fatalx("%s: rdns_count too big: %d", __func__,
+				    rdns.rdns_count);
+			send_rdns_proposal(&rdns);
 			break;
 #endif	/* SMALL */
 		default:
@@ -722,8 +727,8 @@ delete_address(struct imsg_configure_address *address)
 		return;
 	}
 
-	memcpy(&in6_ridreq.ifr_ifru, &address->addr,
-	    sizeof(in6_ridreq.ifr_ifru));
+	memcpy(&in6_ridreq.ifr_addr, &address->addr,
+	    sizeof(in6_ridreq.ifr_addr));
 
 	log_debug("%s: %s", __func__, if_name);
 
@@ -834,7 +839,7 @@ delete_gateway(struct imsg_configure_dfr *dfr)
 
 #ifndef	SMALL
 void
-send_rdns_proposal(struct imsg_propose_rdns *rdns, uint8_t rtm_flags)
+send_rdns_proposal(struct imsg_propose_rdns *rdns)
 {
 	struct rt_msghdr		 rtm;
 	struct sockaddr_rtdns		 rtdns;
@@ -852,7 +857,7 @@ send_rdns_proposal(struct imsg_propose_rdns *rdns, uint8_t rtm_flags)
 	rtm.rtm_seq = ++rtm_seq;
 	rtm.rtm_priority = RTP_PROPOSAL_SLAAC;
 	rtm.rtm_addrs = RTA_DNS;
-	rtm.rtm_flags = rtm_flags;
+	rtm.rtm_flags = RTF_UP;
 
 	iov[iovcnt].iov_base = &rtm;
 	iov[iovcnt++].iov_len = sizeof(rtm);

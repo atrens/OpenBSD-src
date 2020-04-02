@@ -1,4 +1,4 @@
-/* $OpenBSD: mode-tree.c,v 1.36 2019/08/16 11:49:12 nicm Exp $ */
+/* $OpenBSD: mode-tree.c,v 1.38 2020/03/20 17:26:14 nicm Exp $ */
 
 /*
  * Copyright (c) 2017 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -598,6 +598,8 @@ mode_tree_draw(struct mode_tree_data *mtd)
 		xasprintf(&text, "%-*s%s%s%s: ", keylen, key, start, mti->name,
 		    tag);
 		width = utf8_cstrwidth(text);
+		if (width > w)
+			width = w;
 		free(start);
 
 		if (mti->tagged) {
@@ -607,11 +609,11 @@ mode_tree_draw(struct mode_tree_data *mtd)
 
 		if (i != mtd->current) {
 			screen_write_clearendofline(&ctx, 8);
-			screen_write_puts(&ctx, &gc0, "%s", text);
+			screen_write_nputs(&ctx, w, &gc0, "%s", text);
 			format_draw(&ctx, &gc0, w - width, mti->text, NULL);
 		} else {
 			screen_write_clearendofline(&ctx, gc.bg);
-			screen_write_puts(&ctx, &gc, "%s", text);
+			screen_write_nputs(&ctx, w, &gc, "%s", text);
 			format_draw(&ctx, &gc, w - width, mti->text, NULL);
 		}
 		free(text);
@@ -845,6 +847,10 @@ mode_tree_display_menu(struct mode_tree_data *mtd, struct client *c, u_int x,
 	mtm->itemdata = mti->itemdata;
 	mtd->references++;
 
+	if (x >= (menu->width + 4) / 2)
+		x -= (menu->width + 4) / 2;
+	else
+		x = 0;
 	if (menu_display(menu, 0, NULL, x, y, c, NULL, mode_tree_menu_callback,
 	    mtm) != 0)
 		menu_free(menu);

@@ -1,4 +1,4 @@
-/* $OpenBSD: sshkey.c,v 1.95 2019/11/18 06:58:00 djm Exp $ */
+/* $OpenBSD: sshkey.c,v 1.102 2020/03/06 18:23:17 markus Exp $ */
 /*
  * Copyright (c) 2000, 2001 Markus Friedl.  All rights reserved.
  * Copyright (c) 2008 Alexander von Gernler.  All rights reserved.
@@ -990,10 +990,8 @@ sshkey_fingerprint_raw(const struct sshkey *k, int dgst_alg,
 	r = 0;
  out:
 	free(ret);
-	if (blob != NULL) {
-		explicit_bzero(blob, blob_len);
-		free(blob);
-	}
+	if (blob != NULL)
+		freezero(blob, blob_len);
 	return r;
 }
 
@@ -1251,12 +1249,10 @@ sshkey_fingerprint(const struct sshkey *k, int dgst_alg,
 		    dgst_raw, dgst_raw_len, k);
 		break;
 	default:
-		explicit_bzero(dgst_raw, dgst_raw_len);
-		free(dgst_raw);
+		freezero(dgst_raw, dgst_raw_len);
 		return NULL;
 	}
-	explicit_bzero(dgst_raw, dgst_raw_len);
-	free(dgst_raw);
+	freezero(dgst_raw, dgst_raw_len);
 	return retval;
 }
 
@@ -2041,6 +2037,9 @@ sshkey_shield_private(struct sshkey *k)
 	enc = prekey = NULL; /* transferred */
 	enclen = 0;
 
+	/* preserve key fields that are required for correct operation */
+	k->sk_flags = kswap->sk_flags;
+
 	/* success */
 	r = 0;
 
@@ -2262,7 +2261,7 @@ cert_parse(struct sshbuf *b, struct sshkey *key, struct sshbuf *certbuf)
 		goto out;
 	}
 	if ((ret = sshkey_verify(key->cert->signature_key, sig, slen,
-	    sshbuf_ptr(key->cert->certblob), signed_len, NULL, 0)) != 0)
+	    sshbuf_ptr(key->cert->certblob), signed_len, NULL, 0, NULL)) != 0)
 		goto out;
 	if ((ret = sshkey_get_sigtype(sig, slen,
 	    &key->cert->signature_type)) != 0)
@@ -2704,11 +2703,6 @@ sshkey_sign(struct sshkey *key,
 	case KEY_ECDSA:
 		r = ssh_ecdsa_sign(key, sigp, lenp, data, datalen, compat);
 		break;
-	case KEY_ECDSA_SK_CERT:
-	case KEY_ECDSA_SK:
-		r = sshsk_sign(sk_provider, key, sigp, lenp, data, datalen,
-		    compat);
-		break;
 	case KEY_RSA_CERT:
 	case KEY_RSA:
 		r = ssh_rsa_sign(key, sigp, lenp, data, datalen, alg);
@@ -2720,8 +2714,10 @@ sshkey_sign(struct sshkey *key,
 		break;
 	case KEY_ED25519_SK:
 	case KEY_ED25519_SK_CERT:
-		r = sshsk_sign(sk_provider, key, sigp, lenp, data, datalen,
-		    compat);
+	case KEY_ECDSA_SK_CERT:
+	case KEY_ECDSA_SK:
+		r = sshsk_sign(sk_provider, key, sigp, lenp, data,
+		    datalen, compat, /* XXX PIN */ NULL);
 		break;
 #ifdef WITH_XMSS
 	case KEY_XMSS:
@@ -2745,8 +2741,11 @@ sshkey_sign(struct sshkey *key,
 int
 sshkey_verify(const struct sshkey *key,
     const u_char *sig, size_t siglen,
-    const u_char *data, size_t dlen, const char *alg, u_int compat)
+    const u_char *data, size_t dlen, const char *alg, u_int compat,
+    struct sshkey_sig_details **detailsp)
 {
+	if (detailsp != NULL)
+		*detailsp = NULL;
 	if (siglen == 0 || dlen > SSH_KEY_MAX_SIGN_DATA_SIZE)
 		return SSH_ERR_INVALID_ARGUMENT;
 	switch (key->type) {
@@ -2760,7 +2759,7 @@ sshkey_verify(const struct sshkey *key,
 	case KEY_ECDSA_SK_CERT:
 	case KEY_ECDSA_SK:
 		return ssh_ecdsa_sk_verify(key, sig, siglen, data, dlen,
-		    compat);
+		    compat, detailsp);
 	case KEY_RSA_CERT:
 	case KEY_RSA:
 		return ssh_rsa_verify(key, sig, siglen, data, dlen, alg);
@@ -2771,7 +2770,7 @@ sshkey_verify(const struct sshkey *key,
 	case KEY_ED25519_SK:
 	case KEY_ED25519_SK_CERT:
 		return ssh_ed25519_sk_verify(key, sig, siglen, data, dlen,
-		    compat);
+		    compat, detailsp);
 #ifdef WITH_XMSS
 	case KEY_XMSS:
 	case KEY_XMSS_CERT:
@@ -3028,8 +3027,8 @@ sshkey_cert_check_authority(const struct sshkey *k,
 	u_int i, principal_matches;
 	time_t now = time(NULL);
 
-	if (reason != NULL)
-		*reason = NULL;
+	if (reason == NULL)
+		return SSH_ERR_INVALID_ARGUMENT;
 
 	if (want_host) {
 		if (k->cert->type != SSH2_CERT_TYPE_HOST) {
@@ -3996,18 +3995,12 @@ sshkey_private_to_blob2(struct sshkey *prv, struct sshbuf *blob,
 	sshbuf_free(encrypted);
 	cipher_free(ciphercontext);
 	explicit_bzero(salt, sizeof(salt));
-	if (key != NULL) {
-		explicit_bzero(key, keylen + ivlen);
-		free(key);
-	}
-	if (pubkeyblob != NULL) {
-		explicit_bzero(pubkeyblob, pubkeylen);
-		free(pubkeyblob);
-	}
-	if (b64 != NULL) {
-		explicit_bzero(b64, strlen(b64));
-		free(b64);
-	}
+	if (key != NULL)
+		freezero(key, keylen + ivlen);
+	if (pubkeyblob != NULL) 
+		freezero(pubkeyblob, pubkeylen);
+	if (b64 != NULL) 
+		freezero(b64, strlen(b64));
 	return r;
 }
 
@@ -4099,18 +4092,18 @@ sshkey_parse_private2(struct sshbuf *blob, int type, const char *passphrase,
 		r = SSH_ERR_KEY_UNKNOWN_CIPHER;
 		goto out;
 	}
-	if ((passphrase == NULL || strlen(passphrase) == 0) &&
-	    strcmp(ciphername, "none") != 0) {
-		/* passphrase required */
-		r = SSH_ERR_KEY_WRONG_PASSPHRASE;
-		goto out;
-	}
 	if (strcmp(kdfname, "none") != 0 && strcmp(kdfname, "bcrypt") != 0) {
 		r = SSH_ERR_KEY_UNKNOWN_CIPHER;
 		goto out;
 	}
-	if (!strcmp(kdfname, "none") && strcmp(ciphername, "none") != 0) {
+	if (strcmp(kdfname, "none") == 0 && strcmp(ciphername, "none") != 0) {
 		r = SSH_ERR_INVALID_FORMAT;
+		goto out;
+	}
+	if ((passphrase == NULL || strlen(passphrase) == 0) &&
+	    strcmp(kdfname, "none") != 0) {
+		/* passphrase required */
+		r = SSH_ERR_KEY_WRONG_PASSPHRASE;
 		goto out;
 	}
 	if (nkeys != 1) {
@@ -4215,14 +4208,10 @@ sshkey_parse_private2(struct sshbuf *blob, int type, const char *passphrase,
 	free(ciphername);
 	free(kdfname);
 	free(comment);
-	if (salt != NULL) {
-		explicit_bzero(salt, slen);
-		free(salt);
-	}
-	if (key != NULL) {
-		explicit_bzero(key, keylen + ivlen);
-		free(key);
-	}
+	if (salt != NULL)
+		freezero(salt, slen);
+	if (key != NULL)
+		freezero(key, keylen + ivlen);
 	sshbuf_free(encoded);
 	sshbuf_free(decoded);
 	sshbuf_free(kdf);
@@ -4580,6 +4569,12 @@ sshkey_parse_private_fileblob(struct sshbuf *buffer, const char *passphrase,
 
 	return sshkey_parse_private_fileblob_type(buffer, KEY_UNSPEC,
 	    passphrase, keyp, commentp);
+}
+
+void
+sshkey_sig_details_free(struct sshkey_sig_details *details)
+{
+	freezero(details, sizeof(*details));
 }
 
 #ifdef WITH_XMSS

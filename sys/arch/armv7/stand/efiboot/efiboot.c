@@ -1,4 +1,4 @@
-/*	$OpenBSD: efiboot.c,v 1.25 2019/10/25 10:06:40 kettenis Exp $	*/
+/*	$OpenBSD: efiboot.c,v 1.28 2020/03/30 11:55:47 kettenis Exp $	*/
 
 /*
  * Copyright (c) 2015 YASUOKA Masahiko <yasuoka@yasuoka.net>
@@ -19,6 +19,7 @@
 
 #include <sys/param.h>
 #include <sys/queue.h>
+#include <sys/stat.h>
 #include <dev/cons.h>
 #include <sys/disklabel.h>
 
@@ -30,11 +31,13 @@
 #include <lib/libkern/libkern.h>
 #include <stand/boot/cmd.h>
 
+#include "libsa.h"
 #include "disk.h"
+
+#include "efidev.h"
 #include "efiboot.h"
 #include "eficall.h"
 #include "fdt.h"
-#include "libsa.h"
 
 EFI_SYSTEM_TABLE	*ST;
 EFI_BOOT_SERVICES	*BS;
@@ -60,6 +63,7 @@ static void efi_heap_init(void);
 static void efi_memprobe_internal(void);
 static void efi_timer_init(void);
 static void efi_timer_cleanup(void);
+static EFI_STATUS efi_memprobe_find(UINTN, UINTN, EFI_PHYSICAL_ADDRESS *);
 
 EFI_STATUS
 efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *systab)
@@ -205,18 +209,22 @@ efi_heap_init(void)
 		panic("BS->AllocatePages()");
 }
 
-EFI_BLOCK_IO	*disk;
+struct disklist_lh disklist;
+struct diskinfo *bootdev_dip;
 
 void
 efi_diskprobe(void)
 {
-	int			 i, depth = -1;
+	int			 i, bootdev = 0, depth = -1;
 	UINTN			 sz;
 	EFI_STATUS		 status;
 	EFI_HANDLE		*handles = NULL;
 	EFI_BLOCK_IO		*blkio;
 	EFI_BLOCK_IO_MEDIA	*media;
+	struct diskinfo		*di;
 	EFI_DEVICE_PATH		*dp;
+
+	TAILQ_INIT(&disklist);
 
 	sz = 0;
 	status = EFI_CALL(BS->LocateHandle, ByProtocol, &blkio_guid, 0, &sz, 0);
@@ -249,20 +257,35 @@ efi_diskprobe(void)
 		media = blkio->Media;
 		if (media->LogicalPartition || !media->MediaPresent)
 			continue;
+		di = alloc(sizeof(struct diskinfo));
+		efid_init(di, blkio);
 
-		if (efi_bootdp == NULL || depth == -1)
-			continue;
+		if (efi_bootdp == NULL || depth == -1 || bootdev != 0)
+			goto next;
 		status = EFI_CALL(BS->HandleProtocol, handles[i], &devp_guid,
 		    (void **)&dp);
 		if (EFI_ERROR(status))
-			continue;
+			goto next;
 		if (efi_device_path_ncmp(efi_bootdp, dp, depth) == 0) {
-			disk = blkio;
-			break;
+			TAILQ_INSERT_HEAD(&disklist, di, list);
+			bootdev_dip = di;
+			bootdev = 1;
+			continue;
 		}
+next:
+		TAILQ_INSERT_TAIL(&disklist, di, list);
 	}
 
 	free(handles, sz);
+
+	/* Print available disks. */
+	i = 0;
+	printf("disks:");
+	TAILQ_FOREACH(di, &disklist, list) {
+		printf(" sd%d%s", i, di == bootdev_dip ? "*" : "");
+		i++;
+	}
+	printf("\n");
 }
 
 /*
@@ -279,7 +302,7 @@ efi_device_path_depth(EFI_DEVICE_PATH *dp, int dptype)
 			return (i);
 	}
 
-	return (-1);
+	return (i);
 }
 
 int
@@ -444,6 +467,7 @@ efi_console(void)
 	fdt_node_add_property(node, "stdout-path", path, strlen(path) + 1);
 }
 
+void *fdt = NULL;
 char *bootmac = NULL;
 static EFI_GUID fdt_guid = FDT_TABLE_GUID;
 
@@ -452,7 +476,6 @@ static EFI_GUID fdt_guid = FDT_TABLE_GUID;
 void *
 efi_makebootargs(char *bootargs, uint32_t *board_id)
 {
-	void *fdt = NULL;
 	u_char bootduid[8];
 	u_char zero[8] = { 0 };
 	uint64_t uefi_system_table = htobe64((uintptr_t)ST);
@@ -460,10 +483,12 @@ efi_makebootargs(char *bootargs, uint32_t *board_id)
 	size_t len;
 	int i;
 
-	for (i = 0; i < ST->NumberOfTableEntries; i++) {
-		if (efi_guidcmp(&fdt_guid,
-		    &ST->ConfigurationTable[i].VendorGuid) == 0)
-			fdt = ST->ConfigurationTable[i].VendorTable;
+	if (fdt == NULL) {
+		for (i = 0; i < ST->NumberOfTableEntries; i++) {
+			if (efi_guidcmp(&fdt_guid,
+			    &ST->ConfigurationTable[i].VendorGuid) == 0)
+				fdt = ST->ConfigurationTable[i].VendorTable;
+		}
 	}
 
 	if (!fdt_init(fdt))
@@ -477,10 +502,13 @@ efi_makebootargs(char *bootargs, uint32_t *board_id)
 	fdt_node_add_property(node, "bootargs", bootargs, len);
 
 	/* Pass DUID of the boot disk. */
-	memcpy(&bootduid, diskinfo.disklabel.d_uid, sizeof(bootduid));
-	if (memcmp(bootduid, zero, sizeof(bootduid)) != 0) {
-		fdt_node_add_property(node, "openbsd,bootduid", bootduid,
+	if (bootdev_dip) {
+		memcpy(&bootduid, bootdev_dip->disklabel.d_uid,
 		    sizeof(bootduid));
+		if (memcmp(bootduid, zero, sizeof(bootduid)) != 0) {
+			fdt_node_add_property(node, "openbsd,bootduid",
+			    bootduid, sizeof(bootduid));
+		}
 	}
 
 	/* Pass netboot interface address. */
@@ -662,10 +690,30 @@ getsecs(void)
 void
 devboot(dev_t dev, char *p)
 {
-	if (disk)
-		strlcpy(p, "sd0a", 5);
-	else
+	struct diskinfo *dip;
+	int sd_boot_vol = 0;
+	int part_type = FS_UNUSED;
+
+	if (bootdev_dip == NULL) {
 		strlcpy(p, "tftp0a", 7);
+		return;
+	}
+
+	TAILQ_FOREACH(dip, &disklist, list) {
+		if (bootdev_dip == dip)
+			break;
+		sd_boot_vol++;
+	}
+
+	/*
+	 * Determine the partition type for the 'a' partition of the
+	 * boot device.
+	 */
+	if ((bootdev_dip->flags & DISKINFO_FLAG_GOODLABEL) != 0)
+		part_type = bootdev_dip->disklabel.d_partitions[0].p_fstype;
+
+	strlcpy(p, "sd0a", 5);
+	p[2] = '0' + sd_boot_vol;
 }
 
 const char cdevs[][4] = { "com", "fb" };
@@ -826,18 +874,93 @@ efi_memprobe_internal(void)
 	mmap_version = mmver;
 }
 
+static EFI_STATUS
+efi_memprobe_find(UINTN pages, UINTN align, EFI_PHYSICAL_ADDRESS *addr)
+{
+	EFI_MEMORY_DESCRIPTOR	*mm;
+	int			 i, j;
+
+	if (align < EFI_PAGE_SIZE)
+		return EFI_INVALID_PARAMETER;
+
+	efi_memprobe_internal();	/* sync the current map */
+
+	for (i = 0, mm = mmap; i < mmap_ndesc;
+	    i++, mm = NextMemoryDescriptor(mm, mmap_descsiz)) {
+		if (mm->Type != EfiConventionalMemory)
+			continue;
+
+		if (mm->NumberOfPages < pages)
+			continue;
+
+		for (j = 0; j < mm->NumberOfPages; j++) {
+			EFI_PHYSICAL_ADDRESS paddr;
+
+			if (mm->NumberOfPages - j < pages)
+				break;
+
+			paddr = mm->PhysicalStart + (j * EFI_PAGE_SIZE);
+			if (paddr & (align - 1))
+				continue;
+
+			if (EFI_CALL(BS->AllocatePages, AllocateAddress,
+			    EfiLoaderData, pages, &paddr) == EFI_SUCCESS) {
+				*addr = paddr;
+				return EFI_SUCCESS;
+			}
+		}
+	}
+	return EFI_OUT_OF_RESOURCES;
+}
+
 /*
  * Commands
  */
 
+int Xdtb_efi(void);
 int Xexit_efi(void);
 int Xpoweroff_efi(void);
 
 const struct cmd_table cmd_machine[] = {
+	{ "dtb",	CMDT_CMD, Xdtb_efi },
 	{ "exit",	CMDT_CMD, Xexit_efi },
 	{ "poweroff",	CMDT_CMD, Xpoweroff_efi },
 	{ NULL, 0 }
 };
+
+int
+Xdtb_efi(void)
+{
+	EFI_PHYSICAL_ADDRESS addr;
+	char path[MAXPATHLEN];
+	struct stat sb;
+	int fd;
+
+#define O_RDONLY	0
+
+	if (cmd.argc != 2)
+		return (1);
+
+	snprintf(path, sizeof(path), "%s:%s", cmd.bootdev, cmd.argv[1]);
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0 || fstat(fd, &sb) == -1) {
+		printf("cannot open %s\n", path);
+		return (1);
+	}
+	if (efi_memprobe_find(EFI_SIZE_TO_PAGES(sb.st_size),
+	    0x1000, &addr) != EFI_SUCCESS) {
+		printf("cannot allocate memory for %s\n", path);
+		return (1);
+	}
+	if (read(fd, (void *)addr, sb.st_size) != sb.st_size) {
+		printf("cannot read from %s\n", path);
+		return (1);
+	}
+
+	fdt = (void *)addr;
+	return (0);
+}
 
 int
 Xexit_efi(void)

@@ -1,4 +1,4 @@
-/* $OpenBSD: cmd.c,v 1.155 2019/10/03 10:24:05 nicm Exp $ */
+/* $OpenBSD: cmd.c,v 1.157 2020/03/24 08:09:43 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -44,6 +44,7 @@ extern const struct cmd_entry cmd_delete_buffer_entry;
 extern const struct cmd_entry cmd_detach_client_entry;
 extern const struct cmd_entry cmd_display_menu_entry;
 extern const struct cmd_entry cmd_display_message_entry;
+extern const struct cmd_entry cmd_display_popup_entry;
 extern const struct cmd_entry cmd_display_panes_entry;
 extern const struct cmd_entry cmd_down_pane_entry;
 extern const struct cmd_entry cmd_find_window_entry;
@@ -133,6 +134,7 @@ const struct cmd_entry *cmd_table[] = {
 	&cmd_detach_client_entry,
 	&cmd_display_menu_entry,
 	&cmd_display_message_entry,
+	&cmd_display_popup_entry,
 	&cmd_display_panes_entry,
 	&cmd_find_window_entry,
 	&cmd_has_session_entry,
@@ -661,7 +663,7 @@ char *
 cmd_template_replace(const char *template, const char *s, int idx)
 {
 	char		 ch, *buf;
-	const char	*ptr, *cp, quote[] = "\"\\$;";
+	const char	*ptr, *cp, quote[] = "\"\\$;~";
 	int		 replaced, quoted;
 	size_t		 len;
 

@@ -1,4 +1,4 @@
-/*	$OpenBSD: engine.c,v 1.46 2019/11/21 19:27:33 florian Exp $	*/
+/*	$OpenBSD: engine.c,v 1.48 2020/03/28 16:15:45 florian Exp $	*/
 
 /*
  * Copyright (c) 2017 Florian Obser <florian@openbsd.org>
@@ -85,6 +85,11 @@
 #define	MAX_RTR_SOLICITATION_DELAY_USEC	MAX_RTR_SOLICITATION_DELAY * 1000000
 #define	RTR_SOLICITATION_INTERVAL	4
 #define	MAX_RTR_SOLICITATIONS		3
+
+/* constants for RFC 4941 autoconf privacy extension */
+#define ND6_PRIV_MAX_DESYNC_FACTOR	512	/* largest pow2 < 10 minutes */
+#define ND6_PRIV_VALID_LIFETIME		172800	/* 2 days */
+#define ND6_PRIV_PREFERRED_LIFETIME	86400	/* 1 day */
 
 enum if_state {
 	IF_DOWN,
@@ -280,9 +285,7 @@ void			 gen_rdns_proposal(struct slaacd_iface *, struct
 			     radv *);
 void			 propose_rdns(struct rdns_proposal *);
 void			 free_rdns_proposal(struct rdns_proposal *);
-void			 withdraw_rdns(struct rdns_proposal *);
-void			 compose_rdns_proposal(enum imsg_type,
-			     struct rdns_proposal *);
+void			 compose_rdns_proposal(uint32_t);
 #endif	/* SMALL */
 char			*parse_dnssl(char *, int);
 void			 update_iface_ra(struct slaacd_iface *, struct radv *);
@@ -435,9 +438,6 @@ engine_dispatch_frontend(int fd, short event, void *bula)
 	struct imsg_ra			 ra;
 	struct address_proposal		*addr_proposal = NULL;
 	struct dfr_proposal		*dfr_proposal = NULL;
-#ifndef	SMALL
-	struct rdns_proposal		*rdns_proposal = NULL;
-#endif	/* SMALL */
 	struct imsg_del_addr		 del_addr;
 	struct imsg_del_route		 del_route;
 	struct imsg_dup_addr		 dup_addr;
@@ -581,13 +581,8 @@ engine_dispatch_frontend(int fd, short event, void *bula)
 			break;
 #ifndef	SMALL
 		case IMSG_REPROPOSE_RDNS:
-			LIST_FOREACH (iface, &slaacd_interfaces, entries) {
-				LIST_FOREACH (rdns_proposal,
-				    &iface->rdns_proposals, entries) {
-					compose_rdns_proposal(IMSG_PROPOSE_RDNS,
-					    rdns_proposal);
-				}
-			}
+			LIST_FOREACH (iface, &slaacd_interfaces, entries)
+				compose_rdns_proposal(iface->if_index);
 			break;
 #endif	/* SMALL */
 		default:
@@ -1112,6 +1107,7 @@ remove_slaacd_iface(uint32_t if_index)
 		rdns_proposal = LIST_FIRST(&iface->rdns_proposals);
 		free_rdns_proposal(rdns_proposal);
 	}
+	compose_rdns_proposal(iface->if_index);
 #endif	/* SMALL */
 	evtimer_del(&iface->timer);
 	free(iface);
@@ -2261,25 +2257,31 @@ propose_rdns(struct rdns_proposal *rdns_proposal)
 		/* nothing to do here rDNS proposals do not expire */
 		return;
 	}
-	compose_rdns_proposal(IMSG_PROPOSE_RDNS, rdns_proposal);
+	compose_rdns_proposal(rdns_proposal->if_index);
 }
 
 void
-withdraw_rdns(struct rdns_proposal *rdns_proposal)
+compose_rdns_proposal(uint32_t if_index)
 {
-	compose_rdns_proposal(IMSG_WITHDRAW_RDNS, rdns_proposal);
-}
+	struct imsg_propose_rdns rdns;
+	struct slaacd_iface	*iface;
+	struct rdns_proposal	*rdns_proposal;
+	int			 i;
 
-void
-compose_rdns_proposal(enum imsg_type type, struct rdns_proposal *rdns_proposal)
-{
-	struct imsg_propose_rdns	 rdns;
+	memset(&rdns, 0, sizeof(rdns));
+	rdns.if_index = if_index;
 
-	rdns.if_index = rdns_proposal->if_index;
-	rdns.rdns_count = rdns_proposal->rdns_count;
-	memcpy(&rdns.rdns, &rdns_proposal->rdns, sizeof(rdns.rdns));
+	if ((iface = get_slaacd_iface_by_id(if_index)) != NULL) {
+		LIST_FOREACH(rdns_proposal, &iface->rdns_proposals, entries) {
+			for (i = 0; i < rdns_proposal->rdns_count &&
+				 rdns.rdns_count < MAX_RDNS_COUNT; i++) {
+				rdns.rdns[rdns.rdns_count++] =
+				    rdns_proposal->rdns[i];
+			}
+		}
+	}
 
-	engine_imsg_compose_main(type, 0, &rdns, sizeof(rdns));
+	engine_imsg_compose_main(IMSG_PROPOSE_RDNS, 0, &rdns, sizeof(rdns));
 }
 
 void
@@ -2290,15 +2292,6 @@ free_rdns_proposal(struct rdns_proposal *rdns_proposal)
 
 	LIST_REMOVE(rdns_proposal, entries);
 	evtimer_del(&rdns_proposal->timer);
-	switch (rdns_proposal->state) {
-	case PROPOSAL_SENT:
-	case PROPOSAL_NEARLY_EXPIRED:
-	case PROPOSAL_STALE:
-		withdraw_rdns(rdns_proposal);
-		break;
-	default:
-		break;
-	}
 	free(rdns_proposal);
 }
 #endif	/* SMALL */
@@ -2452,6 +2445,7 @@ rdns_proposal_timeout(int fd, short events, void *arg)
 {
 	struct rdns_proposal	*rdns_proposal;
 	struct timeval		 tv;
+	uint32_t		 if_index;
 	const char		*hbuf;
 
 	rdns_proposal = (struct rdns_proposal *)arg;
@@ -2477,8 +2471,10 @@ rdns_proposal_timeout(int fd, short events, void *arg)
 	case PROPOSAL_NEARLY_EXPIRED:
 		if (real_lifetime(&rdns_proposal->uptime,
 		    rdns_proposal->rdns_lifetime) == 0) {
+			if_index = rdns_proposal->if_index;
 			free_rdns_proposal(rdns_proposal);
 			log_debug("%s: removing rdns proposal", __func__);
+			compose_rdns_proposal(if_index);
 			break;
 		}
 		engine_imsg_compose_frontend(IMSG_CTL_SEND_SOLICITATION,
@@ -2545,6 +2541,7 @@ iface_timeout(int fd, short events, void *arg)
 				rdns_proposal->state = PROPOSAL_STALE;
 				free_rdns_proposal(rdns_proposal);
 			}
+			compose_rdns_proposal(iface->if_index);
 #endif	/* SMALL */
 			break;
 		case IF_DOWN:

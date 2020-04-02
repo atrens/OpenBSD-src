@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_iwmreg.h,v 1.44 2019/11/18 18:53:11 stsp Exp $	*/
+/*	$OpenBSD: if_iwmreg.h,v 1.46 2020/03/05 14:56:50 stsp Exp $	*/
 
 /******************************************************************************
  *
@@ -667,6 +667,77 @@
 #define IWM_DTS_DIODE_REG_FLAGS_VREFS_ID	0x00000003 /* bits [1:0] */
 #define IWM_DTS_DIODE_REG_FLAGS_PASS_ONCE_POS	7
 #define IWM_DTS_DIODE_REG_FLAGS_PASS_ONCE	0x00000080 /* bits [7:7] */
+
+/*****************************************************************************
+ *                        MSIX related registers                             *
+ *****************************************************************************/
+
+#define IWM_CSR_MSIX_BASE			(0x2000)
+#define IWM_CSR_MSIX_FH_INT_CAUSES_AD		(IWM_CSR_MSIX_BASE + 0x800)
+#define IWM_CSR_MSIX_FH_INT_MASK_AD		(IWM_CSR_MSIX_BASE + 0x804)
+#define IWM_CSR_MSIX_HW_INT_CAUSES_AD		(IWM_CSR_MSIX_BASE + 0x808)
+#define IWM_CSR_MSIX_HW_INT_MASK_AD		(IWM_CSR_MSIX_BASE + 0x80C)
+#define IWM_CSR_MSIX_AUTOMASK_ST_AD		(IWM_CSR_MSIX_BASE + 0x810)
+#define IWM_CSR_MSIX_RX_IVAR_AD_REG		(IWM_CSR_MSIX_BASE + 0x880)
+#define IWM_CSR_MSIX_IVAR_AD_REG		(IWM_CSR_MSIX_BASE + 0x890)
+#define IWM_CSR_MSIX_PENDING_PBA_AD		(IWM_CSR_MSIX_BASE + 0x1000)
+#define IWM_CSR_MSIX_RX_IVAR(cause)		(IWM_CSR_MSIX_RX_IVAR_AD_REG + (cause))
+#define IWM_CSR_MSIX_IVAR(cause)		(IWM_CSR_MSIX_IVAR_AD_REG + (cause))
+
+/*
+ * Causes for the FH register interrupts
+ */
+enum msix_fh_int_causes {
+	IWM_MSIX_FH_INT_CAUSES_Q0		= (1 << 0),
+	IWM_MSIX_FH_INT_CAUSES_Q1		= (1 << 1),
+	IWM_MSIX_FH_INT_CAUSES_D2S_CH0_NUM	= (1 << 16),
+	IWM_MSIX_FH_INT_CAUSES_D2S_CH1_NUM	= (1 << 17),
+	IWM_MSIX_FH_INT_CAUSES_S2D		= (1 << 19),
+	IWM_MSIX_FH_INT_CAUSES_FH_ERR		= (1 << 21),
+};
+
+/*
+ * Causes for the HW register interrupts
+ */
+enum msix_hw_int_causes {
+	IWM_MSIX_HW_INT_CAUSES_REG_ALIVE	= (1 << 0),
+	IWM_MSIX_HW_INT_CAUSES_REG_WAKEUP	= (1 << 1),
+	IWM_MSIX_HW_INT_CAUSES_REG_IPC		= (1 << 1),
+	IWM_MSIX_HW_INT_CAUSES_REG_IML		= (1 << 2),
+	IWM_MSIX_HW_INT_CAUSES_REG_SW_ERR_V2	= (1 << 5),
+	IWM_MSIX_HW_INT_CAUSES_REG_CT_KILL	= (1 << 6),
+	IWM_MSIX_HW_INT_CAUSES_REG_RF_KILL	= (1 << 7),
+	IWM_MSIX_HW_INT_CAUSES_REG_PERIODIC	= (1 << 8),
+	IWM_MSIX_HW_INT_CAUSES_REG_SW_ERR	= (1 << 25),
+	IWM_MSIX_HW_INT_CAUSES_REG_SCD		= (1 << 26),
+	IWM_MSIX_HW_INT_CAUSES_REG_FH_TX	= (1 << 27),
+	IWM_MSIX_HW_INT_CAUSES_REG_HW_ERR	= (1 << 29),
+	IWM_MSIX_HW_INT_CAUSES_REG_HAP		= (1 << 30),
+};
+
+/*
+ * Registers to map causes to vectors
+ */
+enum msix_ivar_for_cause {
+	IWM_MSIX_IVAR_CAUSE_D2S_CH0_NUM		= 0x0,
+	IWM_MSIX_IVAR_CAUSE_D2S_CH1_NUM		= 0x1,
+	IWM_MSIX_IVAR_CAUSE_S2D			= 0x3,
+	IWM_MSIX_IVAR_CAUSE_FH_ERR		= 0x5,
+	IWM_MSIX_IVAR_CAUSE_REG_ALIVE		= 0x10,
+	IWM_MSIX_IVAR_CAUSE_REG_WAKEUP		= 0x11,
+	IWM_MSIX_IVAR_CAUSE_REG_IML		= 0x12,
+	IWM_MSIX_IVAR_CAUSE_REG_CT_KILL		= 0x16,
+	IWM_MSIX_IVAR_CAUSE_REG_RF_KILL		= 0x17,
+	IWM_MSIX_IVAR_CAUSE_REG_PERIODIC	= 0x18,
+	IWM_MSIX_IVAR_CAUSE_REG_SW_ERR		= 0x29,
+	IWM_MSIX_IVAR_CAUSE_REG_SCD		= 0x2a,
+	IWM_MSIX_IVAR_CAUSE_REG_FH_TX		= 0x2b,
+	IWM_MSIX_IVAR_CAUSE_REG_HW_ERR		= 0x2d,
+	IWM_MSIX_IVAR_CAUSE_REG_HAP		= 0x2e,
+};
+
+#define IWM_MSIX_AUTO_CLEAR_CAUSE		(0 << 7)
+#define IWM_MSIX_NON_AUTO_CLEAR_CAUSE		(1 << 7)
 
 /**
  * uCode API flags
@@ -4690,8 +4761,6 @@ struct iwm_tx_cmd {
  *	occur if tx failed for this frame when it was a member of a previous
  *	aggregation block). If rate scaling is used, retry count indicates the
  *	rate table entry used for all frames in the new agg.
- * @IWM_AGG_TX_STATE_SEQ_NUM_MSK: Command ID and sequence number of Tx command for
- *	this frame
  */
 #define IWM_AGG_TX_STATE_STATUS_MSK		0x0fff
 #define IWM_AGG_TX_STATE_TRANSMITTED		0x0000
@@ -4748,12 +4817,14 @@ struct iwm_tx_cmd {
 
 /**
  * struct iwm_agg_tx_status - per packet TX aggregation status
- * @status: enum iwm_tx_agg_status
- * @sequence: Sequence # for this frame's Tx cmd (not SSN!)
+ * @status: IWM_AGG_TX_STATE_*
+ * @idx: Tx queue index of this frame
+ * @qid: Tx queue ID of this frame
  */
 struct iwm_agg_tx_status {
 	uint16_t status;
-	uint16_t sequence;
+	uint8_t idx;
+	uint8_t qid;
 } __packed;
 
 /*
@@ -4787,7 +4858,7 @@ struct iwm_agg_tx_status {
  * @pa_integ_res_c: tx power info
  * @measurement_req_id: tx power info
  * @tfd_info: TFD information set by the FH
- * @seq_ctl: sequence control from the Tx cmd
+ * @seq_ctl: sequence control field from IEEE80211 frame header
  * @byte_cnt: byte count from the Tx cmd
  * @tlc_info: TLC rate info
  * @ra_tid: bits [3:0] = ra, bits [7:4] = tid
@@ -4831,7 +4902,8 @@ struct iwm_tx_resp {
  * @sta_addr_hi16: upper 16 bits of the MAC address
  * @sta_id: Index of recipient (BA-sending) station in fw's station table
  * @tid: tid of the session
- * @seq_ctl:
+ * @seq_ctl: sequence control field from IEEE80211 frame header (it is unclear
+ *  which frame this relates to; info or reverse engineering welcome)
  * @bitmap: the bitmap of the BA notification as seen in the air
  * @scd_flow: the tx queue this BA relates to
  * @scd_ssn: the index of the last contiguously sent packet

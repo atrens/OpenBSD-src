@@ -1,4 +1,4 @@
-/*	$OpenBSD: init_main.c,v 1.292 2019/11/04 17:51:22 anton Exp $	*/
+/*	$OpenBSD: init_main.c,v 1.297 2020/03/13 09:25:21 mpi Exp $	*/
 /*	$NetBSD: init_main.c,v 1.84.4.1 1996/06/02 09:08:06 mrg Exp $	*/
 
 /*
@@ -111,7 +111,7 @@ extern void nfs_init(void);
 const char	copyright[] =
 "Copyright (c) 1982, 1986, 1989, 1991, 1993\n"
 "\tThe Regents of the University of California.  All rights reserved.\n"
-"Copyright (c) 1995-2019 OpenBSD. All rights reserved.  https://www.OpenBSD.org\n";
+"Copyright (c) 1995-2020 OpenBSD. All rights reserved.  https://www.OpenBSD.org\n";
 
 /* Components of the first process -- never freed. */
 struct	session session0;
@@ -464,7 +464,7 @@ main(void *framep)
 	 * secondary processors, yet.
 	 */
 	while (config_pending)
-		(void) tsleep((void *)&config_pending, PWAIT, "cfpend", 0);
+		tsleep_nsec(&config_pending, PWAIT, "cfpend", INFSLP);
 
 	dostartuphooks();
 
@@ -551,6 +551,9 @@ main(void *framep)
 	cpu_boot_secondary_processors();
 #endif
 
+	/* Now that all CPUs partake in scheduling, start SMR thread. */
+	smr_startup_thread();
+
 	config_process_deferred_mountroot();
 
 	/*
@@ -572,7 +575,7 @@ main(void *framep)
          * proc0: nothing to do, back to sleep
          */
         while (1)
-                tsleep(&proc0, PVM, "scheduler", 0);
+                tsleep_nsec(&proc0, PVM, "scheduler", INFSLP);
 	/* NOTREACHED */
 }
 
@@ -631,12 +634,12 @@ start_init(void *arg)
 	 * Wait for main() to tell us that it's safe to exec.
 	 */
 	while (start_init_exec == 0)
-		(void) tsleep((void *)&start_init_exec, PWAIT, "initexec", 0);
+		tsleep_nsec(&start_init_exec, PWAIT, "initexec", INFSLP);
 
 	check_console(p);
 
 	/* process 0 ignores SIGCHLD, but we can't */
-	p->p_p->ps_sigacts->ps_flags = 0;
+	p->p_p->ps_sigacts->ps_sigflags = 0;
 
 	/*
 	 * Need just enough stack to hold the faked-up "execve()" arguments.
@@ -651,7 +654,8 @@ start_init(void *arg)
 	if (uvm_map(&p->p_vmspace->vm_map, &addr, PAGE_SIZE, 
 	    NULL, UVM_UNKNOWN_OFFSET, 0,
 	    UVM_MAPFLAG(PROT_READ | PROT_WRITE, PROT_MASK, MAP_INHERIT_COPY,
-	    MADV_NORMAL, UVM_FLAG_FIXED|UVM_FLAG_OVERLAY|UVM_FLAG_COPYONW|UVM_FLAG_STACK)))
+	    MADV_NORMAL,
+	    UVM_FLAG_FIXED|UVM_FLAG_OVERLAY|UVM_FLAG_COPYONW|UVM_FLAG_STACK|UVM_FLAG_SYSCALL)))
 		panic("init: couldn't allocate argument space");
 
 	for (pathp = &initpaths[0]; (path = *pathp) != NULL; pathp++) {

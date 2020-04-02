@@ -1,4 +1,4 @@
-/* $OpenBSD: netcat.c,v 1.212 2019/11/17 17:38:33 deraadt Exp $ */
+/* $OpenBSD: netcat.c,v 1.217 2020/02/12 14:46:36 schwarze Exp $ */
 /*
  * Copyright (c) 2001 Eric Jackson <ericj@monkey.org>
  * Copyright (c) 2015 Bob Beck.  All rights reserved.
@@ -371,13 +371,24 @@ main(int argc, char *argv[])
 			err(1, "unveil");
 		if (oflag && unveil(oflag, "r") == -1)
 			err(1, "unveil");
+	} else if (family == AF_UNIX && uflag && lflag && !kflag) {
+		/*
+		 * After recvfrom(2) from client, the server connects
+		 * to the client socket.  As the client path is determined
+		 * during runtime, we cannot unveil(2).
+		 */
 	} else {
 		if (family == AF_UNIX) {
 			if (unveil(host, "rwc") == -1)
 				err(1, "unveil");
-			if (uflag && !lflag) {
-				if (unveil(sflag ? sflag : "/tmp", "rwc") == -1)
-					err(1, "unveil");
+			if (uflag && !kflag) {
+				if (sflag) {
+					if (unveil(sflag, "rwc") == -1)
+						err(1, "unveil");
+				} else {
+					if (unveil("/tmp", "rwc") == -1)
+						err(1, "unveil");
+				}
 			}
 		} else {
 			/* no filesystem visibility */
@@ -569,6 +580,10 @@ main(int argc, char *argv[])
 			if (s == -1)
 				err(1, NULL);
 			if (uflag && kflag) {
+				if (family == AF_UNIX) {
+					if (pledge("stdio unix", NULL) == -1)
+						err(1, "pledge");
+				}
 				/*
 				 * For UDP and -k, don't connect the socket,
 				 * let it receive datagrams from multiple
@@ -595,9 +610,14 @@ main(int argc, char *argv[])
 				if (rv == -1)
 					err(1, "connect");
 
+				if (family == AF_UNIX) {
+					if (pledge("stdio unix", NULL) == -1)
+						err(1, "pledge");
+				}
 				if (vflag)
 					report_sock("Connection received",
-					    (struct sockaddr *)&z, len, NULL);
+					    (struct sockaddr *)&z, len,
+					    family == AF_UNIX ? host : NULL);
 
 				readwrite(s, NULL);
 			} else {
@@ -815,8 +835,8 @@ tls_setup_client(struct tls *tls_ctx, int s, char *host)
 	}
 	if (vflag)
 		report_tls(tls_ctx, host);
-	if (tls_expecthash && tls_peer_cert_hash(tls_ctx) &&
-	    strcmp(tls_expecthash, tls_peer_cert_hash(tls_ctx)) != 0)
+	if (tls_expecthash && (tls_peer_cert_hash(tls_ctx) == NULL ||
+	    strcmp(tls_expecthash, tls_peer_cert_hash(tls_ctx)) != 0))
 		errx(1, "peer certificate is not %s", tls_expecthash);
 	if (Zflag) {
 		save_peer_cert(tls_ctx, Zflag);
@@ -844,8 +864,9 @@ tls_setup_server(struct tls *tls_ctx, int connfd, char *host)
 			report_tls(tls_cctx, host);
 		if ((TLSopt & TLS_CCERT) && !gotcert)
 			warnx("No client certificate provided");
-		else if (gotcert && tls_peer_cert_hash(tls_ctx) && tls_expecthash &&
-		    strcmp(tls_expecthash, tls_peer_cert_hash(tls_ctx)) != 0)
+		else if (gotcert && tls_expecthash &&
+		    (tls_peer_cert_hash(tls_cctx) == NULL ||
+		    strcmp(tls_expecthash, tls_peer_cert_hash(tls_cctx)) != 0))
 			warnx("peer certificate is not %s", tls_expecthash);
 		else if (gotcert && tls_expectname &&
 		    (!tls_peer_cert_contains_name(tls_cctx, tls_expectname)))
@@ -1099,14 +1120,13 @@ void
 readwrite(int net_fd, struct tls *tls_ctx)
 {
 	struct pollfd pfd[4];
-	int gone[4] = { 0 };
 	int stdin_fd = STDIN_FILENO;
 	int stdout_fd = STDOUT_FILENO;
 	unsigned char netinbuf[BUFSIZE];
 	size_t netinbufpos = 0;
 	unsigned char stdinbuf[BUFSIZE];
 	size_t stdinbufpos = 0;
-	int n, num_fds, shutdown_netin, shutdown_netout;
+	int n, num_fds;
 	ssize_t ret;
 
 	/* don't read from stdin if requested */
@@ -1129,20 +1149,17 @@ readwrite(int net_fd, struct tls *tls_ctx)
 	pfd[POLL_STDOUT].fd = stdout_fd;
 	pfd[POLL_STDOUT].events = 0;
 
-	/* used to indicate we wish to shut down the network socket */
-	shutdown_netin = shutdown_netout = 0;
-
 	while (1) {
 		/* both inputs are gone, buffers are empty, we are done */
-		if (gone[POLL_STDIN] && gone[POLL_NETIN] &&
+		if (pfd[POLL_STDIN].fd == -1 && pfd[POLL_NETIN].fd == -1 &&
 		    stdinbufpos == 0 && netinbufpos == 0)
 			return;
 		/* both outputs are gone, we can't continue */
-		if (gone[POLL_NETOUT] && gone[POLL_STDOUT])
+		if (pfd[POLL_NETOUT].fd == -1 && pfd[POLL_STDOUT].fd == -1)
 			return;
 		/* listen and net in gone, queues empty, done */
-		if (lflag && gone[POLL_NETIN] && stdinbufpos == 0
-		    && netinbufpos == 0)
+		if (lflag && pfd[POLL_NETIN].fd == -1 &&
+		    stdinbufpos == 0 && netinbufpos == 0)
 			return;
 
 		/* help says -i is for "wait between lines sent". We read and
@@ -1150,12 +1167,6 @@ readwrite(int net_fd, struct tls *tls_ctx)
 		 * scanning for newlines, so this is as good as it gets */
 		if (iflag)
 			sleep(iflag);
-
-		/* If it's gone, take it away from poll */
-		for (n = 0; n < 4; n++) {
-			if (gone[n])
-				pfd[n].events = pfd[n].revents = 0;
-		}
 
 		/* poll */
 		num_fds = poll(pfd, 4, timeout);
@@ -1171,36 +1182,36 @@ readwrite(int net_fd, struct tls *tls_ctx)
 		/* treat socket error conditions */
 		for (n = 0; n < 4; n++) {
 			if (pfd[n].revents & (POLLERR|POLLNVAL)) {
-				gone[n] = 1;
+				pfd[n].fd = -1;
 			}
 		}
 		/* reading is possible after HUP */
 		if (pfd[POLL_STDIN].events & POLLIN &&
 		    pfd[POLL_STDIN].revents & POLLHUP &&
 		    !(pfd[POLL_STDIN].revents & POLLIN))
-			gone[POLL_STDIN] = 1;
+			pfd[POLL_STDIN].fd = -1;
 
 		if (pfd[POLL_NETIN].events & POLLIN &&
 		    pfd[POLL_NETIN].revents & POLLHUP &&
 		    !(pfd[POLL_NETIN].revents & POLLIN))
-			gone[POLL_NETIN] = 1;
+			pfd[POLL_NETIN].fd = -1;
 
 		if (pfd[POLL_NETOUT].revents & POLLHUP) {
 			if (Nflag)
-				shutdown_netout = 1;
-			gone[POLL_NETOUT] = 1;
+				shutdown(pfd[POLL_NETOUT].fd, SHUT_WR);
+			pfd[POLL_NETOUT].fd = -1;
 		}
-		/* if no net out, stop watching stdin */
-		if (gone[POLL_NETOUT])
-			gone[POLL_STDIN] = 1;
-
-		/* if stdout HUP's, stop watching stdout */
+		/* if HUP, stop watching stdout */
 		if (pfd[POLL_STDOUT].revents & POLLHUP)
-			gone[POLL_STDOUT] = 1;
+			pfd[POLL_STDOUT].fd = -1;
+		/* if no net out, stop watching stdin */
+		if (pfd[POLL_NETOUT].fd == -1)
+			pfd[POLL_STDIN].fd = -1;
 		/* if no stdout, stop watching net in */
-		if (gone[POLL_STDOUT]) {
-			shutdown_netin = 1;
-			gone[POLL_NETIN] = 1;
+		if (pfd[POLL_STDOUT].fd == -1) {
+			if (pfd[POLL_NETIN].fd != -1)
+				shutdown(pfd[POLL_NETIN].fd, SHUT_RD);
+			pfd[POLL_NETIN].fd = -1;
 		}
 
 		/* try to read from stdin */
@@ -1212,7 +1223,7 @@ readwrite(int net_fd, struct tls *tls_ctx)
 			else if (ret == TLS_WANT_POLLOUT)
 				pfd[POLL_STDIN].events = POLLOUT;
 			else if (ret == 0 || ret == -1)
-				gone[POLL_STDIN] = 1;
+				pfd[POLL_STDIN].fd = -1;
 			/* read something - poll net out */
 			if (stdinbufpos > 0)
 				pfd[POLL_NETOUT].events = POLLOUT;
@@ -1229,7 +1240,7 @@ readwrite(int net_fd, struct tls *tls_ctx)
 			else if (ret == TLS_WANT_POLLOUT)
 				pfd[POLL_NETOUT].events = POLLOUT;
 			else if (ret == -1)
-				gone[POLL_NETOUT] = 1;
+				pfd[POLL_NETOUT].fd = -1;
 			/* buffer empty - remove self from polling */
 			if (stdinbufpos == 0)
 				pfd[POLL_NETOUT].events = 0;
@@ -1246,15 +1257,17 @@ readwrite(int net_fd, struct tls *tls_ctx)
 			else if (ret == TLS_WANT_POLLOUT)
 				pfd[POLL_NETIN].events = POLLOUT;
 			else if (ret == -1)
-				gone[POLL_NETIN] = 1;
+				pfd[POLL_NETIN].fd = -1;
 			/* eof on net in - remove from pfd */
 			if (ret == 0) {
-				gone[POLL_NETIN] = 1;
+				shutdown(pfd[POLL_NETIN].fd, SHUT_RD);
+				pfd[POLL_NETIN].fd = -1;
 			}
 			if (recvlimit > 0 && ++recvcount >= recvlimit) {
-				shutdown_netin = 1;
-				gone[POLL_NETIN] = 1;
-				gone[POLL_STDIN] = 1;
+				if (pfd[POLL_NETIN].fd != -1)
+					shutdown(pfd[POLL_NETIN].fd, SHUT_RD);
+				pfd[POLL_NETIN].fd = -1;
+				pfd[POLL_STDIN].fd = -1;
 			}
 			/* read something - poll stdout */
 			if (netinbufpos > 0)
@@ -1276,7 +1289,7 @@ readwrite(int net_fd, struct tls *tls_ctx)
 			else if (ret == TLS_WANT_POLLOUT)
 				pfd[POLL_STDOUT].events = POLLOUT;
 			else if (ret == -1)
-				gone[POLL_STDOUT] = 1;
+				pfd[POLL_STDOUT].fd = -1;
 			/* buffer empty - remove self from polling */
 			if (netinbufpos == 0)
 				pfd[POLL_STDOUT].events = 0;
@@ -1286,34 +1299,14 @@ readwrite(int net_fd, struct tls *tls_ctx)
 		}
 
 		/* stdin gone and queue empty? */
-		if (gone[POLL_STDIN] && stdinbufpos == 0) {
-			if (Nflag) {
-				shutdown_netin = 1;
-				shutdown_netout = 1;
-			}
-			gone[POLL_NETOUT] = 1;
+		if (pfd[POLL_STDIN].fd == -1 && stdinbufpos == 0) {
+			if (pfd[POLL_NETOUT].fd != -1 && Nflag)
+				shutdown(pfd[POLL_NETOUT].fd, SHUT_WR);
+			pfd[POLL_NETOUT].fd = -1;
 		}
 		/* net in gone and queue empty? */
-		if (gone[POLL_NETIN] && netinbufpos == 0) {
-			if (Nflag) {
-				shutdown_netin = 1;
-				shutdown_netout = 1;
-			}
-			gone[POLL_STDOUT] = 1;
-		}
-
-		/* call tls_close if any part of the network socket is closing */
-		if ((shutdown_netin || shutdown_netout) && usetls) {
-				timeout_tls(pfd[POLL_NETIN].fd, tls_ctx, tls_close);
-				shutdown_netout = shutdown_netin = 1;
-		}
-		if (shutdown_netin) {
-			shutdown(pfd[POLL_NETIN].fd, SHUT_RD);
-			gone[POLL_NETIN] = 1;
-		}
-		if (shutdown_netout) {
-			shutdown(pfd[POLL_NETOUT].fd, SHUT_WR);
-			gone[POLL_NETOUT] = 1;
+		if (pfd[POLL_NETIN].fd == -1 && netinbufpos == 0) {
+			pfd[POLL_STDOUT].fd = -1;
 		}
 	}
 }
@@ -1784,11 +1777,14 @@ report_sock(const char *msg, const struct sockaddr *sa, socklen_t salen,
 	if (nflag)
 		flags |= NI_NUMERICHOST;
 
-	if ((herr = getnameinfo(sa, salen, host, sizeof(host),
-	    port, sizeof(port), flags)) != 0) {
-		if (herr == EAI_SYSTEM)
+	herr = getnameinfo(sa, salen, host, sizeof(host), port, sizeof(port),
+	    flags);
+	switch (herr) {
+		case 0:
+			break;
+		case EAI_SYSTEM:
 			err(1, "getnameinfo");
-		else
+		default:
 			errx(1, "getnameinfo: %s", gai_strerror(herr));
 	}
 
@@ -1826,7 +1822,7 @@ help(void)
 	\t-R CAfile	CA bundle\n\
 	\t-r		Randomize remote ports\n\
 	\t-S		Enable the TCP MD5 signature option\n\
-	\t-s source	Local source address\n\
+	\t-s sourceaddr	Local source address\n\
 	\t-T keyword	TOS value or TLS options\n\
 	\t-t		Answer TELNET negotiation\n\
 	\t-U		Use UNIX domain socket\n\
@@ -1852,7 +1848,7 @@ usage(int ret)
 	    "\t  [-i interval] [-K keyfile] [-M ttl] [-m minttl] [-O length]\n"
 	    "\t  [-o staplefile] [-P proxy_username] [-p source_port] "
 	    "[-R CAfile]\n"
-	    "\t  [-s source] [-T keyword] [-V rtable] [-W recvlimit] "
+	    "\t  [-s sourceaddr] [-T keyword] [-V rtable] [-W recvlimit] "
 	    "[-w timeout]\n"
 	    "\t  [-X proxy_protocol] [-x proxy_address[:port]] "
 	    "[-Z peercertfile]\n"

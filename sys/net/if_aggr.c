@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_aggr.c,v 1.24 2019/11/11 03:37:41 dlg Exp $ */
+/*	$OpenBSD: if_aggr.c,v 1.28 2020/03/11 07:01:42 dlg Exp $ */
 
 /*
  * Copyright (c) 2019 The University of Queensland
@@ -307,7 +307,7 @@ struct aggr_multiaddr {
 	unsigned int		m_refs;
 	uint8_t			m_addrlo[ETHER_ADDR_LEN];
 	uint8_t			m_addrhi[ETHER_ADDR_LEN];
-	struct sockaddr		m_addr;
+	struct sockaddr_storage m_addr;
 };
 TAILQ_HEAD(aggr_multiaddrs, aggr_multiaddr);
 
@@ -1022,8 +1022,7 @@ aggr_set_options(struct aggr_softc *sc, const struct trunk_opts *tro)
 		break;
 
 	case TRUNK_OPT_LACP_TIMEOUT:
-		if (opt->lacp_timeout > nitems(aggr_periodic_times) ||
-		    aggr_periodic_times[opt->lacp_timeout] == 0)
+		if (opt->lacp_timeout >= nitems(aggr_periodic_times))
 			return (EINVAL);
 
 		aggr_set_lacp_timeout(sc, opt->lacp_timeout);
@@ -2411,8 +2410,7 @@ aggr_up(struct aggr_softc *sc)
 
 	TAILQ_FOREACH(p, &sc->sc_ports, p_entry) {
 		aggr_rxm(sc, p, LACP_RXM_E_LACP_ENABLED);
-
-		aggr_selection_logic(sc, p);
+		aggr_p_linkch(p);
 	}
 
 	/* start the Periodic Transmission machine */
@@ -2450,6 +2448,7 @@ aggr_iff(struct aggr_softc *sc)
 				    promisc ? "on" : "off");
 			}
 		}
+		rw_exit_read(&sc->sc_lock);
 
 		sc->sc_promisc = promisc;
 	}
@@ -2556,15 +2555,18 @@ aggr_multi(struct aggr_softc *sc, struct aggr_port *p,
     const struct aggr_multiaddr *ma, u_long cmd)
 {
 	struct ifnet *ifp0 = p->p_ifp0;
-	struct ifreq ifr;
+	struct {
+		char			if_name[IFNAMSIZ];
+		struct sockaddr_storage if_addr;
+	} ifr;
 
 	memset(&ifr, 0, sizeof(ifr));
 
 	/* make it convincing */
-	CTASSERT(sizeof(ifr.ifr_name) == sizeof(ifp0->if_xname));
-	memcpy(ifr.ifr_name, ifp0->if_xname, sizeof(ifr.ifr_name));
+	CTASSERT(sizeof(ifr.if_name) == sizeof(ifp0->if_xname));
+	memcpy(ifr.if_name, ifp0->if_xname, sizeof(ifr.if_name));
 
-	ifr.ifr_addr = ma->m_addr;
+	ifr.if_addr = ma->m_addr;
 
 	return ((*p->p_ioctl)(ifp0, cmd, (caddr_t)&ifr));
 }
@@ -2826,12 +2828,12 @@ aggr_multi_add(struct aggr_softc *sc, struct ifreq *ifr)
 		}
 	}
 
-	ma = malloc(sizeof(*ma), M_DEVBUF, M_WAITOK|M_CANFAIL);
+	ma = malloc(sizeof(*ma), M_DEVBUF, M_WAITOK|M_CANFAIL|M_ZERO);
 	if (ma == NULL)
 		return (ENOMEM);
 
 	ma->m_refs = 1;
-	ma->m_addr = ifr->ifr_addr;
+	memcpy(&ma->m_addr, &ifr->ifr_addr, ifr->ifr_addr.sa_len);
 	memcpy(ma->m_addrlo, addrlo, sizeof(ma->m_addrlo));
 	memcpy(ma->m_addrhi, addrhi, sizeof(ma->m_addrhi));
 	TAILQ_INSERT_TAIL(&sc->sc_multiaddrs, ma, m_entry);

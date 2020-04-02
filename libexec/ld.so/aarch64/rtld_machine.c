@@ -1,4 +1,4 @@
-/*	$OpenBSD: rtld_machine.c,v 1.12 2019/10/24 22:11:10 guenther Exp $ */
+/*	$OpenBSD: rtld_machine.c,v 1.20 2020/02/18 12:19:11 kettenis Exp $ */
 
 /*
  * Copyright (c) 2004 Dale Rahn
@@ -242,9 +242,6 @@ _dl_md_reloc_got(elf_object_t *object, int lazy)
 	if (object->Dyn.info[DT_PLTREL] != DT_RELA)
 		return 0;
 
-	if (object->traced)
-		lazy = 1;
-
 	if (!lazy) {
 		fails = _dl_md_reloc(object, DT_JMPREL, DT_PLTRELSZ);
 	} else {
@@ -303,7 +300,7 @@ _dl_bind(elf_object_t *object, int relidx)
 		register long  arg2 __asm("x1") = sizeof(buf);
 		register long  arg3 __asm("x2") = cookie;
 
-		__asm volatile("svc 0" : "+r" (arg1), "+r" (arg2)
+		__asm volatile("svc 0; dsb nsh; isb" : "+r" (arg1), "+r" (arg2)
 		    : "r" (syscall_num), "r" (arg3)
 		    : "cc", "memory");
 	}

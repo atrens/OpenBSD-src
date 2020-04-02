@@ -1,4 +1,4 @@
-/*	$OpenBSD: ifconfig.c,v 1.414 2019/10/24 18:54:10 bluhm Exp $	*/
+/*	$OpenBSD: ifconfig.c,v 1.421 2020/02/27 08:28:35 stsp Exp $	*/
 /*	$NetBSD: ifconfig.c,v 1.40 1997/10/01 02:19:43 enami Exp $	*/
 
 /*
@@ -103,6 +103,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <limits.h>
+#include <resolv.h>
 #include <util.h>
 #include <ifaddrs.h>
 
@@ -399,7 +400,7 @@ const struct	cmd {
 	{ "mtu",	NEXTARG,	0,		setifmtu },
 	{ "nwid",	NEXTARG,	0,		setifnwid },
 	{ "-nwid",	-1,		0,		setifnwid },
-	{ "join",	NEXTARG,	A_JOIN,		setifjoin },
+	{ "join",	NEXTARG,	0,		setifjoin },
 	{ "-join",	NEXTARG,	0,		delifjoin },
 	{ "joinlist",	NEXTARG0,	0,		showjoin },
 	{ "-joinlist",	-1,		0,		delifjoinlist },
@@ -713,7 +714,9 @@ const struct afswtch {
 const struct afswtch *afp;	/*the address family being set or asked about*/
 
 char joinname[IEEE80211_NWID_LEN];
+size_t joinlen;
 char nwidname[IEEE80211_NWID_LEN];
+size_t nwidlen;
 
 int ifaliases = 0;
 int aflag = 0;
@@ -785,11 +788,11 @@ main(int argc, char *argv[])
 	}
 
 	if (!found_rulefile) {
-		if (unveil("/etc/resolv.conf", "r") == -1)
+		if (unveil(_PATH_RESCONF, "r") == -1)
 			err(1, "unveil");
-		if (unveil("/etc/hosts", "r") == -1)
+		if (unveil(_PATH_HOSTS, "r") == -1)
 			err(1, "unveil");
-		if (unveil("/etc/services", "r") == -1)
+		if (unveil(_PATH_SERVICES, "r") == -1)
 			err(1, "unveil");
 		if (unveil(NULL, NULL) == -1)
 			err(1, "unveil");
@@ -1301,6 +1304,7 @@ void
 setifnetmask(const char *addr, int ignored)
 {
 	afp->af_getaddr(addr, MASK);
+	explicit_prefix = 1;
 }
 
 /* ARGSUSED */
@@ -1733,11 +1737,11 @@ setifnwid(const char *val, int d)
 	struct ieee80211_nwid nwid;
 	int len;
 
-	if (strlen(joinname) != 0) {
+	if (joinlen != 0) {
 		errx(1, "nwid and join may not be used at the same time");
 	}
 
-	if (strlen(nwidname) != 0) {
+	if (nwidlen != 0) {
 		errx(1, "nwid may not be specified twice");
 	}
 
@@ -1750,9 +1754,9 @@ setifnwid(const char *val, int d)
 		if (get_string(val, NULL, nwid.i_nwid, &len) == NULL)
 			return;
 	}
-	nwid.i_len = len;
+	nwidlen = nwid.i_len = len;
 	(void)strlcpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name));
-	(void)strlcpy(nwidname, nwid.i_nwid, sizeof(nwidname));
+	memcpy(nwidname, nwid.i_nwid, len);
 	ifr.ifr_data = (caddr_t)&nwid;
 	if (ioctl(sock, SIOCS80211NWID, (caddr_t)&ifr) == -1)
 		warn("SIOCS80211NWID");
@@ -1775,11 +1779,11 @@ setifjoin(const char *val, int d)
 {
 	int len;
 
-	if (strlen(nwidname) != 0) {
+	if (nwidlen != 0) {
 		errx(1, "nwid and join may not be used at the same time");
 	}
 
-	if (strlen(joinname) != 0) {
+	if (joinlen != 0) {
 		errx(1, "join may not be specified twice");
 	}
 
@@ -1794,9 +1798,9 @@ setifjoin(const char *val, int d)
 		if (len == 0)
 			join.i_flags |= IEEE80211_JOIN_ANY;
 	}
-	join.i_len = len;
+	joinlen = join.i_len = len;
 	(void)strlcpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name));
-	(void)strlcpy(joinname, join.i_nwid, sizeof(joinname));
+	memcpy(joinname, join.i_nwid, len);
 
 	actions |= A_JOIN;
 }
@@ -2179,12 +2183,12 @@ setifwpakey(const char *val, int d)
 		strlcpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name));
 
 		/* Use the value specified in 'join' or 'nwid' */
-		if (strlen(joinname) != 0) {
-			strlcpy(nwid.i_nwid, joinname, sizeof(nwid.i_nwid));
-			nwid.i_len = strlen(joinname);
-		} else if (strlen(nwidname) != 0) {
-			strlcpy(nwid.i_nwid, nwidname, sizeof(nwid.i_nwid));
-			nwid.i_len = strlen(nwidname);
+		if (joinlen != 0) {
+			memcpy(nwid.i_nwid, joinname, joinlen);
+			nwid.i_len = joinlen;
+		} else if (nwidlen != 0) {
+			memcpy(nwid.i_nwid, nwidname, nwidlen);
+			nwid.i_len = nwidlen;
 		} else {
 			warnx("no nwid or join command, guessing nwid to use");
 
@@ -2571,15 +2575,13 @@ join_status(void)
 		if (len > maxlen)
 			maxlen = len;
 	}
-	if (maxlen > IEEE80211_NWID_LEN)
-		maxlen = IEEE80211_NWID_LEN - 1;
 
 	for (i = 0; i < ja.ja_nodes; i++) {
 		printf("\t      ");
 		if (jn[i].i_len > IEEE80211_NWID_LEN)
 			jn[i].i_len = IEEE80211_NWID_LEN;
 		len = print_string(jn[i].i_nwid, jn[i].i_len);
-		printf("%-*s", maxlen - len, " ");
+		printf("%-*s", maxlen - len, "");
 		if (jn[i].i_flags) {
 			const char *sep;
 			printf(" ");
@@ -5662,6 +5664,7 @@ umb_status(void)
 	char	 apn[UMB_APN_MAXLEN+1];
 	char	 pn[UMB_PHONENR_MAXLEN+1];
 	int	 i, n;
+	char	 astr[INET6_ADDRSTRLEN];
 
 	memset((char *)&mi, 0, sizeof(mi));
 	ifr.ifr_data = (caddr_t)&mi;
@@ -5826,7 +5829,15 @@ umb_status(void)
 	for (i = 0, n = 0; i < UMB_MAX_DNSSRV; i++) {
 		if (mi.ipv4dns[i].s_addr == INADDR_ANY)
 			break;
-		printf("%s %s", n++ ? "" : "\tdns", inet_ntoa(mi.ipv4dns[i]));
+		printf("%s %s", n++ ? "" : "\tdns",
+		    inet_ntop(AF_INET, &mi.ipv4dns[i], astr, sizeof(astr)));
+	}
+	for (i = 0; i < UMB_MAX_DNSSRV; i++) {
+		if (memcmp(&mi.ipv6dns[i], &in6addr_any,
+		    sizeof (mi.ipv6dns[i])) == 0)
+			break;
+		printf("%s %s", n++ ? "" : "\tdns",
+		    inet_ntop(AF_INET6, &mi.ipv6dns[i], astr, sizeof(astr)));
 	}
 	if (n)
 		printf("\n");

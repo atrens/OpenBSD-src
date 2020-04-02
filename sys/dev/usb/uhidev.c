@@ -1,4 +1,4 @@
-/*	$OpenBSD: uhidev.c,v 1.77 2019/11/13 10:40:03 patrick Exp $	*/
+/*	$OpenBSD: uhidev.c,v 1.79 2020/02/22 14:01:34 jasper Exp $	*/
 /*	$NetBSD: uhidev.c,v 1.14 2003/03/11 16:44:00 augustss Exp $	*/
 
 /*
@@ -168,14 +168,14 @@ uhidev_attach(struct device *parent, struct device *self, void *aux)
 		    ed->bLength, ed->bDescriptorType,
 		    ed->bEndpointAddress & UE_ADDR,
 		    UE_GET_DIR(ed->bEndpointAddress)==UE_DIR_IN? "in" : "out",
-		    ed->bmAttributes & UE_XFERTYPE,
+		    UE_GET_XFERTYPE(ed->bmAttributes),
 		    UGETW(ed->wMaxPacketSize), ed->bInterval));
 
 		if (UE_GET_DIR(ed->bEndpointAddress) == UE_DIR_IN &&
-		    (ed->bmAttributes & UE_XFERTYPE) == UE_INTERRUPT) {
+		    UE_GET_XFERTYPE(ed->bmAttributes) == UE_INTERRUPT) {
 			sc->sc_iep_addr = ed->bEndpointAddress;
 		} else if (UE_GET_DIR(ed->bEndpointAddress) == UE_DIR_OUT &&
-		    (ed->bmAttributes & UE_XFERTYPE) == UE_INTERRUPT) {
+		    UE_GET_XFERTYPE(ed->bmAttributes) == UE_INTERRUPT) {
 			sc->sc_oep_addr = ed->bEndpointAddress;
 		} else {
 			printf("%s: unexpected endpoint\n", DEVNAME(sc));
@@ -606,6 +606,19 @@ uhidev_close(struct uhidev *scd)
 		return;
 	DPRINTF(("uhidev_close: close pipe\n"));
 
+	/* Disable interrupts. */
+	if (sc->sc_opipe != NULL) {
+		usbd_abort_pipe(sc->sc_opipe);
+		usbd_close_pipe(sc->sc_opipe);
+		sc->sc_opipe = NULL;
+	}
+
+	if (sc->sc_ipipe != NULL) {
+		usbd_abort_pipe(sc->sc_ipipe);
+		usbd_close_pipe(sc->sc_ipipe);
+		sc->sc_ipipe = NULL;
+	}
+
 	if (sc->sc_oxfer != NULL) {
 		usbd_free_xfer(sc->sc_oxfer);
 		sc->sc_oxfer = NULL;
@@ -619,19 +632,6 @@ uhidev_close(struct uhidev *scd)
 	if (sc->sc_ixfer != NULL) {
 		usbd_free_xfer(sc->sc_ixfer);
 		sc->sc_ixfer = NULL;
-	}
-
-	/* Disable interrupts. */
-	if (sc->sc_opipe != NULL) {
-		usbd_abort_pipe(sc->sc_opipe);
-		usbd_close_pipe(sc->sc_opipe);
-		sc->sc_opipe = NULL;
-	}
-
-	if (sc->sc_ipipe != NULL) {
-		usbd_abort_pipe(sc->sc_ipipe);
-		usbd_close_pipe(sc->sc_ipipe);
-		sc->sc_ipipe = NULL;
 	}
 
 	if (sc->sc_ibuf != NULL) {

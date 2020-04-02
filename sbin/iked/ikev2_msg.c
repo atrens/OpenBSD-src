@@ -1,4 +1,4 @@
-/*	$OpenBSD: ikev2_msg.c,v 1.59 2019/11/15 13:55:13 tobhe Exp $	*/
+/*	$OpenBSD: ikev2_msg.c,v 1.64 2020/03/10 09:42:40 tobhe Exp $	*/
 
 /*
  * Copyright (c) 2019 Tobias Heider <tobias.heider@stusta.de>
@@ -78,7 +78,7 @@ ikev2_msg_cb(int fd, short event, void *arg)
 		return;
 
 	if (socket_getport((struct sockaddr *)&msg.msg_local) ==
-	    IKED_NATT_PORT) {
+	    env->sc_nattport) {
 		if (memcmp(&natt, buf, sizeof(natt)) != 0)
 			return;
 		msg.msg_natt = 1;
@@ -94,6 +94,7 @@ ikev2_msg_cb(int fd, short event, void *arg)
 		return;
 
 	TAILQ_INIT(&msg.msg_proposals);
+	SLIST_INIT(&msg.msg_certreqs);
 	msg.msg_fd = fd;
 
 	if (hdr.ike_version == IKEV1_VERSION)
@@ -181,6 +182,8 @@ ikev2_msg_copy(struct iked *env, struct iked_message *msg)
 void
 ikev2_msg_cleanup(struct iked *env, struct iked_message *msg)
 {
+	struct iked_certreq	*cr;
+
 	if (msg == msg->msg_parent) {
 		ibuf_release(msg->msg_nonce);
 		ibuf_release(msg->msg_ke);
@@ -199,6 +202,11 @@ ikev2_msg_cleanup(struct iked *env, struct iked_message *msg)
 		msg->msg_cookie2 = NULL;
 
 		config_free_proposals(&msg->msg_proposals, 0);
+		while ((cr = SLIST_FIRST(&msg->msg_certreqs))) {
+			ibuf_release(cr->cr_data);
+			SLIST_REMOVE_HEAD(&msg->msg_certreqs, cr_entry);
+			free(cr);
+		}
 	}
 
 	if (msg->msg_data != NULL) {
@@ -211,16 +219,6 @@ int
 ikev2_msg_valid_ike_sa(struct iked *env, struct ike_header *oldhdr,
     struct iked_message *msg)
 {
-#if 0
-	/* XXX Disabled, see comment below */
-	struct iked_message		 resp;
-	struct ike_header		*hdr;
-	struct ikev2_payload		*pld;
-	struct ikev2_notify		*n;
-	struct ibuf			*buf;
-	struct iked_sa			 sa;
-#endif
-
 	if (msg->msg_sa != NULL && msg->msg_policy != NULL) {
 		if (msg->msg_sa->sa_state == IKEV2_STATE_CLOSED)
 			return (-1);
@@ -239,62 +237,6 @@ ikev2_msg_valid_ike_sa(struct iked *env, struct ike_header *oldhdr,
 		}
 		return (0);
 	}
-
-#if 0
-	/*
-	 * XXX Sending INVALID_IKE_SPIs notifications is disabled
-	 * XXX because it is not mandatory and ignored by most
-	 * XXX implementations.  We might want to enable it in
-	 * XXX combination with a rate-limitation to avoid DoS situations.
-	 */
-
-	/* Fail without error message */
-	if (msg->msg_response || msg->msg_policy == NULL)
-		return (-1);
-
-	/* Invalid IKE SA, return notification */
-	if ((buf = ikev2_msg_init(env, &resp,
-	    &msg->msg_peer, msg->msg_peerlen,
-	    &msg->msg_local, msg->msg_locallen, 1)) == NULL)
-		goto done;
-
-	resp.msg_fd = msg->msg_fd;
-
-	bzero(&sa, sizeof(sa));
-	if ((oldhdr->ike_flags & IKEV2_FLAG_INITIATOR) == 0)
-		sa.sa_hdr.sh_initiator = 1;
-	sa.sa_hdr.sh_ispi = betoh64(oldhdr->ike_ispi);
-	sa.sa_hdr.sh_rspi = betoh64(oldhdr->ike_rspi);
-
-	resp.msg_msgid = betoh32(oldhdr->ike_msgid);
-
-	/* IKE header */
-	if ((hdr = ikev2_add_header(buf, &sa, resp.msg_msgid,
-	    IKEV2_PAYLOAD_NOTIFY, IKEV2_EXCHANGE_INFORMATIONAL,
-	    IKEV2_FLAG_RESPONSE)) == NULL)
-		goto done;
-
-	/* SA payload */
-	if ((pld = ikev2_add_payload(buf)) == NULL)
-		goto done;
-	if ((n = ibuf_advance(buf, sizeof(*n))) == NULL)
-		goto done;
-	n->n_protoid = IKEV2_SAPROTO_IKE;
-	n->n_spisize = 0;
-	n->n_type = htobe16(IKEV2_N_INVALID_IKE_SPI);
-
-	if (ikev2_next_payload(pld, sizeof(*n), IKEV2_PAYLOAD_NONE) == -1)
-		goto done;
-
-	if (ikev2_set_header(hdr, ibuf_size(buf) - sizeof(*hdr)) == -1)
-		goto done;
-
-	(void)ikev2_pld_parse(env, hdr, &resp, 0);
-	(void)ikev2_msg_send(env, &resp);
-
- done:
-	ikev2_msg_cleanup(env, &resp);
-#endif
 
 	/* Always fail */
 	return (-1);
@@ -726,13 +668,13 @@ int
 ikev2_send_encrypted_fragments(struct iked *env, struct iked_sa *sa,
     struct ibuf *in, uint8_t exchange, uint8_t firstpayload, int response) {
 	struct iked_message		 resp;
-	struct ibuf			*buf, *e;
+	struct ibuf			*buf, *e = NULL;
 	struct ike_header		*hdr;
 	struct ikev2_payload		*pld;
 	struct ikev2_frag_payload	*frag;
 	sa_family_t			 sa_fam;
 	size_t				 ivlen, integrlen, blocklen;
-	size_t 				 max_len, left,  offset=0;;
+	size_t 				 max_len, left,  offset=0;
 	size_t				 frag_num = 1, frag_total;
 	uint8_t				*data;
 	uint32_t			 msgid;
@@ -784,7 +726,7 @@ ikev2_send_encrypted_fragments(struct iked *env, struct iked_sa *sa,
 
 		/* Encrypt message and add as an E payload */
 		data = ibuf_seek(in, offset, 0);
-		if((e=ibuf_new(data, MIN(left, max_len))) == NULL) {
+		if ((e = ibuf_new(data, MIN(left, max_len))) == NULL) {
 			goto done;
 		}
 		if ((e = ikev2_msg_encrypt(env, sa, e)) == NULL) {
